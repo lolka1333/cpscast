@@ -49,6 +49,15 @@ jobs:
         run: |
           export PATH=/opt/cross/bin:$PATH
           mips-linux-muslsf-gcc --version | head -1
+          # Safety net: std for musl asks the linker for -lunwind, but a
+          # musl-cross-make toolchain ships the unwinder as libgcc_eh.a.
+          # -Cpanic=immediate-abort should remove the need entirely; if any
+          # crate still references it, this alias keeps the link working.
+          LIBDIR=$(dirname "$(mips-linux-muslsf-gcc -print-libgcc-file-name)")
+          if [ ! -f "$LIBDIR/libunwind.a" ] && [ -f "$LIBDIR/libgcc_eh.a" ]; then
+            sudo cp "$LIBDIR/libgcc_eh.a" "$LIBDIR/libunwind.a"
+            echo "aliased libgcc_eh.a -> libunwind.a in $LIBDIR"
+          fi
           cargo +nightly build --release
           BIN=target/mips-unknown-linux-musl/release/captioncast
           mips-linux-muslsf-strip "$BIN" || true

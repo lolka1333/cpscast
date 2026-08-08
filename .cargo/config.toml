@@ -15,10 +15,19 @@ linker = "mips-linux-muslsf-gcc"
 # instructions this chip does not have. Verified against the router's own
 # busybox: e_flags 0x50001007 -> arch bits 0x50000000 = MIPS32 (r1), soft-float
 # bit set.
+#
+# -Cpanic=immediate-abort: std for a musl target links `-lunwind`, and a
+# musl-cross-make toolchain ships the unwinder as libgcc_eh.a instead, so the
+# link fails with "cannot find -lunwind". We do not want unwinding at all
+# (panic = "abort"), and immediate-abort drops the unwinder from std itself.
+# It needs -Zunstable-options; the old build-std-features="panic_immediate_abort"
+# spelling was removed in current nightlies.
 rustflags = [
   "-C", "target-cpu=mips32",
   "-C", "target-feature=+crt-static",
   "-C", "link-self-contained=no",
+  "-Z", "unstable-options",
+  "-C", "panic=immediate-abort",
 ]
 
 [unstable]
