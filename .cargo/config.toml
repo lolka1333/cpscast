@@ -22,9 +22,17 @@ linker = "mips-linux-muslsf-gcc"
 # (panic = "abort"), and immediate-abort drops the unwinder from std itself.
 # It needs -Zunstable-options; the old build-std-features="panic_immediate_abort"
 # spelling was removed in current nightlies.
+# target-cpu=mips32 ALONE IS NOT ENOUGH: the built-in spec hardcodes
+# features = "+mips32r2,+soft-float", target-cpu does not clear it, and the
+# first CI build came out as ELF flags 0x70001007 (mips32r2) while the router's
+# own busybox is 0x50001007 (MIPS32 r1). r2-only instructions fault on this
+# chip - that is the "Illegal instruction" wall the dropbear build hit. So the
+# feature has to be switched off explicitly. rustc warns that mips32/mips32r2
+# are "unknown and unstable" features; it still passes them to LLVM, which is
+# what matters, and the workflow asserts the resulting ELF flags.
 rustflags = [
   "-C", "target-cpu=mips32",
-  "-C", "target-feature=+crt-static",
+  "-C", "target-feature=+crt-static,-mips32r2,+mips32",
   "-C", "link-self-contained=no",
   "-Z", "unstable-options",
   "-C", "panic=immediate-abort",

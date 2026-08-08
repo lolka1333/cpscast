@@ -62,9 +62,23 @@ jobs:
           BIN=target/mips-unknown-linux-musl/release/captioncast
           mips-linux-muslsf-strip "$BIN" || true
           file "$BIN"; ls -la "$BIN"
-          # must read: big endian, MIPS32 (not r2), soft float
           readelf -h "$BIN" | grep -Ei 'class|data|machine|flags'
           readelf -A "$BIN" | grep -i 'abi_fp' || true
+
+      - name: Assert the binary matches the router's CPU
+        # The router's own busybox reads e_flags 0x50001007: MIPS32 (r1), big
+        # endian, soft float. A mips32r2 binary links and looks fine but faults
+        # with "Illegal instruction" on this chip, so fail here rather than ship
+        # something that only breaks on the device.
+        run: |
+          export PATH=/opt/cross/bin:$PATH
+          BIN=target/mips-unknown-linux-musl/release/captioncast
+          FLAGS=$(readelf -h "$BIN" | sed -n 's/.*Flags: *//p')
+          echo "e_flags: $FLAGS"
+          echo "$FLAGS" | grep -q 'mips32r2' && { echo "FAIL: built for mips32r2, router is r1"; exit 1; }
+          readelf -h "$BIN" | grep -q 'big endian'   || { echo "FAIL: not big endian"; exit 1; }
+          readelf -A "$BIN" | grep -qi 'Soft float'  || { echo "FAIL: not soft float"; exit 1; }
+          echo "OK: big-endian MIPS32 r1, soft float"
 
       - uses: actions/upload-artifact@v4
         with:
