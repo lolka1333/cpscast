@@ -1,0 +1,18 @@
+[package]
+name = "captioncast"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Unauthenticated DLNA media/caption injection PoC for the owner's own Samsung TV, built to run on the RV6699 router"
+
+# No dependencies on purpose: the target is a MIPS32r1 big-endian soft-float
+# router with musl. A std-only binary cross-compiles with nothing but the
+# toolchain and stays small enough to sit in the router's flash.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

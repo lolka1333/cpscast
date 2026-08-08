@@ -1,0 +1,63 @@
+name: build captioncast for RV6699 (MIPS32r1 BE soft-float)
+
+# Same recipe that produced the working dropbear binary for this router: Debian's
+# gcc-mips-linux-gnu is MIPS32r2 + hard-float and SIGILLs on this chip, so the
+# toolchain is built from musl-cross-make with TARGET=mips-linux-muslsf and
+# --with-arch=mips32.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the cross toolchain
+        id: tc
+        uses: actions/cache@v4
+        with:
+          path: /opt/cross
+          key: musl-cross-mips-linux-muslsf-mips32-v1
+
+      - name: Build musl-cross-make toolchain
+        if: steps.tc.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget git
+          git clone --depth 1 https://github.com/richfelker/musl-cross-make
+          cd musl-cross-make
+          cat > config.mak <<'EOF'
+          TARGET = mips-linux-muslsf
+          OUTPUT = /opt/cross
+          GCC_CONFIG += --with-arch=mips32 --disable-libquadmath --disable-decimal-float
+          EOF
+          # the GNU mirrors flake; retry rather than fail the whole job
+          for i in 1 2 3 4 5; do make -j"$(nproc)" && break; sleep 30; done
+          sudo make install
+
+      - name: Rust nightly + rust-src (tier-3 target needs build-std)
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup component add rust-src --toolchain nightly
+
+      - name: Build
+        # The target, the ISA downgrade (r2 -> r1) and build-std all live in
+        # .cargo/config.toml, so this is just `cargo build`.
+        run: |
+          export PATH=/opt/cross/bin:$PATH
+          mips-linux-muslsf-gcc --version | head -1
+          cargo +nightly build --release
+          BIN=target/mips-unknown-linux-musl/release/captioncast
+          mips-linux-muslsf-strip "$BIN" || true
+          file "$BIN"; ls -la "$BIN"
+          # must read: big endian, MIPS32 (not r2), soft float
+          readelf -h "$BIN" | grep -Ei 'class|data|machine|flags'
+          readelf -A "$BIN" | grep -i 'abi_fp' || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: captioncast-mips
+          path: target/mips-unknown-linux-musl/release/captioncast

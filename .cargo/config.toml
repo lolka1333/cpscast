@@ -1,0 +1,30 @@
+# Target: the RV6699's Broadcom MIPS - MIPS32r1, BIG-endian, SOFT-float
+# (busybox ELF e_flags 0x50001007, Tag_GNU_MIPS_ABI_FP=3). Debian's
+# gcc-mips-linux-gnu emits MIPS32r2 + hard-float and the result dies with
+# "Illegal instruction" on this chip; that is the wall the dropbear build hit.
+#
+# Use the BUILT-IN `mips-unknown-linux-musl` target rather than a hand-written
+# .json: the libc crate keys its cfgs off the triple, and a custom name like
+# "mips-unknown-linux-muslsf" makes it fail to compile. The built-in spec is
+# already big-endian and already carries +soft-float; the only mismatch is the
+# ISA level, so downgrade r2 -> r1 with a target-feature flag.
+[target.mips-unknown-linux-musl]
+linker = "mips-linux-muslsf-gcc"
+# target-cpu=mips32 is a first-class option here (rustc --print target-cpus lists
+# it); the built-in target defaults to mips32r2, which would emit r2-only
+# instructions this chip does not have. Verified against the router's own
+# busybox: e_flags 0x50001007 -> arch bits 0x50000000 = MIPS32 (r1), soft-float
+# bit set.
+rustflags = [
+  "-C", "target-cpu=mips32",
+  "-C", "target-feature=+crt-static",
+  "-C", "link-self-contained=no",
+]
+
+[unstable]
+# Tier-3 target: core/std are not shipped, so they are compiled from source.
+# Needs a nightly toolchain plus `rustup component add rust-src --toolchain nightly`.
+build-std = ["std", "panic_abort"]
+
+[build]
+target = "mips-unknown-linux-musl"
