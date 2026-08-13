@@ -23,7 +23,3 @@ strip = true
 [[bin]]
 name = "captioncast"
 path = "src/main.rs"
-
-[[bin]]
-name = "macspoof"
-path = "src/bin/macspoof.rs"

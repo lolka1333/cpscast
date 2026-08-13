@@ -59,11 +59,9 @@ jobs:
             echo "aliased libgcc_eh.a -> libunwind.a in $LIBDIR"
           fi
           cargo +nightly build --release
-          for BIN in target/mips-unknown-linux-musl/release/captioncast                      target/mips-unknown-linux-musl/release/macspoof; do
-            mips-linux-muslsf-strip "$BIN" || true
-            file "$BIN"; ls -la "$BIN"
-          done
           BIN=target/mips-unknown-linux-musl/release/captioncast
+          mips-linux-muslsf-strip "$BIN" || true
+          file "$BIN"; ls -la "$BIN"
           readelf -h "$BIN" | grep -Ei 'class|data|machine|flags'
           readelf -A "$BIN" | grep -i 'abi_fp' || true
 
@@ -85,6 +83,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: captioncast-mips
-          path: |
-            target/mips-unknown-linux-musl/release/captioncast
-            target/mips-unknown-linux-musl/release/macspoof
+          path: target/mips-unknown-linux-musl/release/captioncast

