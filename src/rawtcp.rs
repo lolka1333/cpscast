@@ -295,6 +295,45 @@ impl Conn<'_> {
     }
 }
 
+/// Resolve the peer's MAC ourselves, from the spoofed identity, instead of
+/// leaning on the kernel's neighbour table. That table is only populated if
+/// something already talked to the TV (a ping), and it holds
+/// 00:00:00:00:00:00 while the entry is incomplete - i.e. exactly when the TV
+/// was asleep. Asking directly also means the TV learns our fake address in the
+/// same breath.
+pub fn resolve(iface: &str, src_mac: [u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4])
+    -> io::Result<[u8; 6]>
+{
+    let raw = Raw::open(iface)?;
+    let bcast = [0xffu8; 6];
+    let c = Conn { sp: &Spoof { iface: iface.into(), src_mac, src_ip, dst_mac: bcast },
+                   dst_ip, sport: 0, dport: 0 };
+    let mut buf = vec![0u8; 2048];
+    for _ in 0..8 {
+        raw.send(&c.arp(bcast, dst_ip, false));      // who has dst_ip?
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(600) {
+            let Some(n) = raw.recv(&mut buf) else { continue };
+            let f = &buf[..n];
+            if f.len() < 42 || u16::from_be_bytes([f[12], f[13]]) != ETH_P_ARP {
+                continue;
+            }
+            let a = &f[14..];
+            if u16::from_be_bytes([a[6], a[7]]) != 2 {
+                continue;                             // want a reply
+            }
+            if a[14..18] != dst_ip {
+                continue;                             // from the address we asked about
+            }
+            let mut m = [0u8; 6];
+            m.copy_from_slice(&a[8..14]);
+            return Ok(m);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::TimedOut,
+                       "no ARP reply - is the TV powered on?"))
+}
+
 // ---------------------------------------------------------------- public API
 
 /// One HTTP request/response from the spoofed identity. Same shape as the

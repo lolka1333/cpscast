@@ -693,6 +693,7 @@ fn usage() {
   --ctrl-caption     also fire X_ControlCaption(Enable) during playback
   --remote [url]     point the TV at a remote clip, bypassing our server
   --nopoll           do not poll the renderer while it streams
+  --loop <seconds>   repeat the whole cycle forever, sleeping in between
   --spoof-mac <mac>  send SOAP from this MAC via raw frames (bypasses the
                      TV's MAC-keyed device block-list; needs root)
   --spoof-ip <ip>    source IP for the spoofed frames  (default 192.168.1.240)
@@ -705,6 +706,24 @@ fn usage() {
 // ---------------------------------------------------------------- main
 
 fn main() {
+    // --loop <seconds>: repeat the whole cycle in-process, so no shell wrapper is
+    // needed and the spoof flags stay in one place.
+    let every: Option<u64> = Args::new().val("--loop").and_then(|v| v.parse().ok());
+    loop {
+        run();
+        match every {
+            Some(s) => {
+                println!("
+--- sleeping {s}s ---
+");
+                thread::sleep(Duration::from_secs(s));
+            }
+            None => return,
+        }
+    }
+}
+
+fn run() {
     let args = Args::new();
     if args.has("--help") || args.has("-h") {
         usage();
@@ -728,13 +747,22 @@ fn main() {
         let iface = args.val("--if").unwrap_or_else(|| "br0".into());
         let dst_mac = match args.val("--tv-mac") {
             Some(v) => rawtcp::parse_mac(&v),
-            None => match rawtcp::arp_lookup(&tv_ip) {
-                Some(v) => v,
-                None => {
-                    eprintln!("cannot find {tv_ip} in /proc/net/arp - ping it first,                                or pass --tv-mac");
-                    std::process::exit(1);
+            None => {
+                let ifn = args.val("--if").unwrap_or_else(|| "br0".into());
+                let sm = rawtcp::parse_mac(&m);
+                let si = rawtcp::parse_ip(&src_ip);
+                match rawtcp::resolve(&ifn, sm, si, rawtcp::parse_ip(&tv_ip)) {
+                    Ok(v) => v,
+                    // fall back to whatever the kernel already knows
+                    Err(e) => match rawtcp::arp_lookup(&tv_ip) {
+                        Some(v) => v,
+                        None => {
+                            eprintln!("cannot resolve {tv_ip}: {e}");
+                            std::process::exit(1);
+                        }
+                    },
                 }
-            },
+            }
         };
         println!("    [SPOOF] control channel as {m} / {src_ip} on {iface}                   (interface address untouched)");
         unsafe {
