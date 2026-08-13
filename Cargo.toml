@@ -9,6 +9,9 @@ description = "Unauthenticated DLNA media/caption injection PoC for the owner's 
 # router with musl. A std-only binary cross-compiles with nothing but the
 # toolchain and stays small enough to sit in the router's flash.
 [dependencies]
+# only for the raw-socket bin: std has no AF_PACKET. Cross-compiles fine, it is
+# already built as part of build-std anyway.
+libc = "0.2"
 
 [profile.release]
 opt-level = "z"
@@ -16,3 +19,11 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[[bin]]
+name = "captioncast"
+path = "src/main.rs"
+
+[[bin]]
+name = "macspoof"
+path = "src/bin/macspoof.rs"
