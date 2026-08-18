@@ -19,6 +19,7 @@
 use std::ffi::CString;
 use std::io;
 use std::mem;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const AF_PACKET: libc::c_int = 17;
@@ -32,6 +33,14 @@ const SYN: u8 = 0x02;
 const RST: u8 = 0x04;
 const PSH: u8 = 0x08;
 const ACK: u8 = 0x10;
+
+/// Monotonic per-call sequence. Every control call takes a fresh source port and
+/// initial sequence number from this, so no two calls in one run share a 4-tuple.
+/// Without it the port was effectively constant per process (the old code XORed
+/// in `Instant::now().elapsed()`, which is ~0 ns right after the Instant is made)
+/// and the TV dropped every SYN after the first as a duplicate of a connection it
+/// still held in TIME_WAIT - the intermittent "no SYN/ACK" / 401-on-every-call.
+static PORT_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Where the spoofed frames claim to come from.
 #[derive(Clone)]
@@ -334,6 +343,39 @@ pub fn resolve(iface: &str, src_mac: [u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4])
                        "no ARP reply - is the TV powered on?"))
 }
 
+/// Keep the spoofed identity resolvable for the whole run, on its own socket.
+/// `resolve` only warms the TV's cache once, at startup; the entry ages out
+/// (Linux neigh gc is ~30-60 s) during the long `--nopoll` watch windows, and
+/// then the next control call's SYN/ACK has nowhere to go -> "no SYN/ACK". This
+/// thread answers every `who-has <src_ip>` on demand and re-announces
+/// periodically, so the TV can always reach us no matter when it asks.
+pub fn spawn_arp_responder(sp: &Spoof) {
+    let sp = sp.clone();
+    std::thread::Builder::new()
+        .name("arp".into())
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let Ok(raw) = Raw::open(&sp.iface) else { return };
+            let c = Conn { sp: &sp, dst_ip: [0; 4], sport: 0, dport: 0 };
+            let mut buf = vec![0u8; 2048];
+            // initial burst so the cache is warm before the first SYN
+            for _ in 0..3 {
+                raw.send(&c.arp([0xff; 6], sp.src_ip, true));
+            }
+            let mut last = Instant::now();
+            loop {
+                if let Some(n) = raw.recv(&mut buf) {
+                    c.answer_arp(&raw, &buf[..n]);
+                }
+                if last.elapsed() >= Duration::from_secs(3) {
+                    raw.send(&c.arp([0xff; 6], sp.src_ip, true));
+                    last = Instant::now();
+                }
+            }
+        })
+        .ok();
+}
+
 // ---------------------------------------------------------------- public API
 
 /// One HTTP request/response from the spoofed identity. Same shape as the
@@ -347,42 +389,55 @@ pub fn http_post(
     body: &[u8],
 ) -> io::Result<(u16, String)> {
     let raw = Raw::open(&sp.iface)?;
+    // A fresh 4-tuple *and* ISN per call: the port is a pid-seeded base plus a
+    // process-wide counter, the sequence number is stepped by the same counter.
+    // Two calls in one run can no longer look like a retransmit of each other.
+    let seqn = PORT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = (std::process::id().wrapping_mul(2654435761) >> 16) as u16;
     let c = Conn {
         sp,
         dst_ip: parse_ip(dst_ip),
-        // vary the port per call so a previous connection's state cannot collide
-        sport: 40000
-            + ((std::process::id() as u32).wrapping_mul(2654435761)
-                ^ Instant::now().elapsed().subsec_nanos()) as u16 % 20000,
+        sport: 20000 + base.wrapping_add(seqn as u16) % 40000,
         dport: port,
     };
+    let mut seq: u32 = 0x1000_0000u32.wrapping_add(seqn.wrapping_mul(0x0001_0000));
+    let mut ack: u32 = 0;
 
-    // announce ourselves so the TV can reach us without asking first
+    // Warm the TV's neighbour cache before it has to answer the SYN: a broadcast
+    // gratuitous ARP (here is my identity) plus a unicast who-has to the TV. The
+    // standing responder thread keeps answering later who-has, but the first
+    // frame of a cold call still needs this.
+    raw.send(&c.arp([0xff; 6], sp.src_ip, true));
     raw.send(&c.arp(sp.dst_mac, c.dst_ip, false));
 
-    let mut seq: u32 = 0x1000_0000;
-    let mut ack: u32 = 0;
-    raw.send(&c.tcp(seq, 0, SYN, &[]));
-
     let mut buf = vec![0u8; 4096];
-    let t0 = Instant::now();
     let mut up = false;
-    while t0.elapsed() < Duration::from_secs(5) {
-        let Some(n) = raw.recv(&mut buf) else { continue };
-        c.answer_arp(&raw, &buf[..n]);
-        if let Some((s, fl, _)) = c.parse(&buf[..n]) {
-            if fl & RST != 0 {
-                return Err(io::Error::new(io::ErrorKind::ConnectionRefused,
-                                          "RST during handshake"));
-            }
-            if fl & SYN != 0 && fl & ACK != 0 {
-                seq = seq.wrapping_add(1);
-                ack = s.wrapping_add(1);
-                raw.send(&c.tcp(seq, ack, ACK, &[]));
-                up = true;
-                break;
+    // Retransmit the SYN. An embedded peer with no neighbour entry drops the
+    // first SYN while it ARPs for us and never emits a SYN/ACK on its own, so a
+    // single wait times out with "no SYN/ACK". Resend a few times, answering any
+    // who-has in between, until the cache is warm and the SYN/ACK comes back.
+    'hs: for _ in 0..4 {
+        raw.send(&c.tcp(seq, 0, SYN, &[]));
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(750) {
+            let Some(n) = raw.recv(&mut buf) else { continue };
+            c.answer_arp(&raw, &buf[..n]);
+            if let Some((s, fl, _)) = c.parse(&buf[..n]) {
+                if fl & RST != 0 {
+                    return Err(io::Error::new(io::ErrorKind::ConnectionRefused,
+                                              "RST during handshake"));
+                }
+                if fl & SYN != 0 && fl & ACK != 0 {
+                    seq = seq.wrapping_add(1);
+                    ack = s.wrapping_add(1);
+                    raw.send(&c.tcp(seq, ack, ACK, &[]));
+                    up = true;
+                    break 'hs;
+                }
             }
         }
+        // re-announce before the next SYN in case the drop was ARP-driven
+        raw.send(&c.arp([0xff; 6], sp.src_ip, true));
     }
     if !up {
         return Err(io::Error::new(io::ErrorKind::TimedOut, "no SYN/ACK"));

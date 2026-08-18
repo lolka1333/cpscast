@@ -773,6 +773,11 @@ fn run() {
                 dst_mac,
             });
         }
+        // Keep the spoofed IP resolvable for the whole run so the TV can always
+        // send its SYN/ACK back, even after a long idle watch window.
+        if let Some(sp) = spoof() {
+            rawtcp::spawn_arp_responder(sp);
+        }
     }
 
     if args.has("--status") {
