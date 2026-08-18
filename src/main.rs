@@ -691,6 +691,9 @@ fn usage() {
   --vol              RenderingControl PoC: read volume, set it, read it back
   --set-volume <n>   volume --vol should set                    (default 6)
   --mute             also fire SetMute(1) during --vol
+  --slideshow [on|off]  X_SetTVSlideShow on RenderingControl - the one screen
+                     action an unapproved MAC is not gated on
+  --theme <n>        slideshow theme id                        (default 0)
   --stop             Stop playback + disable the caption, then exit
   --no-caption       A/B control: same media, no subtitle bound
   --ctrl-caption     also fire X_ControlCaption(Enable) during playback
@@ -852,6 +855,54 @@ fn run() {
             Some(v) => println!("SetVolume did not take effect (read back {v}); see the codes above."),
             None => println!("could not read the volume back."),
         }
+        return;
+    }
+
+    // --slideshow: X_SetTVSlideShow lives on RenderingControl, not AVTransport
+    // (RCSImpl::aX_SetTVSlideShow), and it is gated by DMRAcl::getAclPolicy,
+    // which lets an unknown MAC through - unlike Play, whose askAclPolicy raises
+    // the consent dialog. So this is a way to put something on the screen from an
+    // identity the TV has never approved. SCPD args, read out of dmr's embedded
+    // service description: InstanceID, CurrentShowState (bool), CurrentShowTheme
+    // (uint) - the types come from aX_SetTVSlideShow(UpnpAction&, int, bool, uint).
+    if args.has("--slideshow") {
+        let on = args.val("--slideshow").map(|v| v != "off" && v != "0").unwrap_or(true);
+        let theme: u32 = args.val("--theme").and_then(|v| v.parse().ok()).unwrap_or(0);
+        println!("=== X_SetTVSlideShow via RenderingControl (unknown MAC is not gated here) ===");
+
+        let (c, raw) = tv.rc("X_GetTVSlideShow", "");
+        println!(
+            "[1] X_GetTVSlideShow -> HTTP {c}   state={:?} theme={:?}",
+            tag(&raw, "CurrentShowState").unwrap_or("-"),
+            tag(&raw, "CurrentShowTheme").unwrap_or("-")
+        );
+
+        let (c, raw) = tv.rc(
+            "X_SetTVSlideShow",
+            &format!(
+                "<CurrentShowState>{}</CurrentShowState><CurrentShowTheme>{theme}</CurrentShowTheme>",
+                if on { 1 } else { 0 }
+            ),
+        );
+        println!(
+            "[2] X_SetTVSlideShow({}) -> HTTP {c}   {}",
+            if on { "ON" } else { "OFF" },
+            if c == 200 {
+                "ACCEPTED - look at the screen".to_string()
+            } else {
+                format!("UPnPError {} / {}",
+                        tag(&raw, "errorCode").unwrap_or("?"),
+                        tag(&raw, "errorDescription").unwrap_or("?"))
+            }
+        );
+
+        thread::sleep(Duration::from_secs(2));
+        let (c, raw) = tv.rc("X_GetTVSlideShow", "");
+        println!(
+            "[3] X_GetTVSlideShow -> HTTP {c}   state={:?} theme={:?}",
+            tag(&raw, "CurrentShowState").unwrap_or("-"),
+            tag(&raw, "CurrentShowTheme").unwrap_or("-")
+        );
         return;
     }
 
@@ -1050,11 +1101,17 @@ fn run() {
             ("Pause", ""),
             ("SetPlayMode", "<NewPlayMode>NORMAL</NewPlayMode>"),
             ("X_PrefetchURI", &""),
-            ("X_SetTVSlideShow", "<TVSlideShow>ON</TVSlideShow>"),
             ("X_PlayerAppHint", "<PlayerAppHint>1</PlayerAppHint>"),
+            // X_SetTVSlideShow is a RenderingControl action; asking AVTransport for
+            // it only ever answers 401 "Invalid Action". See --slideshow.
+            ("X_GetTVSlideShow", ""),
         ];
         for (action, inner) in probes {
-            let (c, raw) = tv.av(action, inner);
+            let (c, raw) = if action.starts_with("X_GetTVSlideShow") {
+                tv.rc(action, inner)
+            } else {
+                tv.av(action, inner)
+            };
             let code = tag(&raw, "errorCode").unwrap_or("-");
             let desc = tag(&raw, "errorDescription").unwrap_or("");
             println!(
