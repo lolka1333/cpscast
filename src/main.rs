@@ -254,9 +254,17 @@ fn parse_url(u: &str) -> Option<Url<'_>> {
     Some(Url { host, port, path })
 }
 
-/// Minimal POST. Returns (status, body). Good enough for UPnP control, which
-/// always answers with a Content-Length.
 fn http_post(url: &str, headers: &[(&str, &str)], body: &[u8]) -> std::io::Result<(u16, String)> {
+    http_request("POST", url, headers, body)
+}
+
+/// Minimal request with an explicit method. Returns (status, body). Good enough
+/// for UPnP control and for DIAL, which needs POST and DELETE and is picky about
+/// Content-Type - busybox wget always sends x-www-form-urlencoded and cannot
+/// send DELETE at all, which is why this exists rather than a shell one-liner.
+fn http_request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8])
+    -> std::io::Result<(u16, String)>
+{
     let u = parse_url(url)
         .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "bad url"))?;
     let addr = (u.host, u.port)
@@ -268,7 +276,8 @@ fn http_post(url: &str, headers: &[(&str, &str)], body: &[u8]) -> std::io::Resul
     s.set_write_timeout(Some(Duration::from_secs(15)))?;
 
     let mut req = format!(
-        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "{} {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        method,
         u.path,
         u.host,
         u.port,
@@ -694,6 +703,11 @@ fn usage() {
   --slideshow [on|off]  X_SetTVSlideShow on RenderingControl - the one screen
                      action an unapproved MAC is not gated on
   --theme <n>        slideshow theme id                        (default 0)
+  --dial [App]       DIAL on :8080 - read the app state, then launch it. No
+                     token and no ACL there, unlike :8001 and :9197
+  --dial-arg <s>     launch parameters passed to the app, e.g. \"v=<videoid>\"
+  --dial-stop        DELETE <App>/run instead of launching
+  --dial-port <n>    DIAL port                                 (default 8080)
   --stop             Stop playback + disable the caption, then exit
   --no-caption       A/B control: same media, no subtitle bound
   --ctrl-caption     also fire X_ControlCaption(Enable) during playback
@@ -855,6 +869,65 @@ fn run() {
             Some(v) => println!("SetVolume did not take effect (read back {v}); see the codes above."),
             None => println!("could not read the volume back."),
         }
+        return;
+    }
+
+    // --dial: DIAL on port 8080 is a completely separate service from the DLNA
+    // renderer on 9197, and it is NOT behind dmr's ACL: `GET /ws/app/<App>`
+    // answers 200 with the app state to anyone, while every path on the msf
+    // server (8001) answers 401 because that one wants a token. Per the DIAL
+    // spec, POST to the same URL launches the app and the body is handed to it
+    // as its launch parameters (YouTube takes `v=<id>`); DELETE on <App>/run
+    // stops it, which the TV advertises with allowStop="true".
+    if args.has("--dial") {
+        let app = args.val("--dial").unwrap_or_else(|| "YouTube".to_string());
+        let port: u16 = args.val("--dial-port").and_then(|v| v.parse().ok()).unwrap_or(8080);
+        let base = format!("http://{tv_ip}:{port}/ws/app/{app}");
+
+        let state = |label: &str| {
+            match http_request("GET", &base, &[], b"") {
+                Ok((c, b)) => println!(
+                    "{label} GET  {app} -> HTTP {c}  state={:?} version={:?}",
+                    tag(&b, "state").unwrap_or("-"),
+                    tag(&b, "version").unwrap_or("-")
+                ),
+                Err(e) => println!("{label} GET  {app} -> {e}"),
+            }
+        };
+
+        println!("=== DIAL on {tv_ip}:{port} (no token, no ACL, no on-screen prompt) ===");
+        state("[1]");
+
+        if args.has("--dial-stop") {
+            let url = format!("{base}/run");
+            match http_request("DELETE", &url, &[], b"") {
+                Ok((c, _)) => println!("[2] DELETE {app}/run -> HTTP {c}{}",
+                                       if c == 200 || c == 204 { "  STOPPED" } else { "" }),
+                Err(e) => println!("[2] DELETE {app}/run -> {e}"),
+            }
+        } else {
+            // text/plain matters: busybox wget sends x-www-form-urlencoded and the
+            // TV answers 400 to that.
+            let arg = args.val("--dial-arg").unwrap_or_default();
+            match http_request("POST", &base,
+                               &[("Content-Type", "text/plain; charset=utf-8")],
+                               arg.as_bytes()) {
+                Ok((c, b)) => {
+                    println!(
+                        "[2] POST {app} (body {:?}) -> HTTP {c}{}",
+                        arg,
+                        if c == 201 { "  LAUNCHED - look at the screen" } else { "" }
+                    );
+                    if c != 201 && !b.is_empty() {
+                        println!("    {}", &b[..b.len().min(200)]);
+                    }
+                }
+                Err(e) => println!("[2] POST {app} -> {e}"),
+            }
+        }
+
+        thread::sleep(Duration::from_secs(3));
+        state("[3]");
         return;
     }
 
