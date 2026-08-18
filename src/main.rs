@@ -921,29 +921,38 @@ fn run() {
             .split(',')
             .filter_map(|p| p.trim().parse().ok())
             .collect();
-        println!("=== probing {host} through the TV (SetAVTransportURI, unauthenticated) ===");
-        println!("    the TV fetches the URI before replying, so its answer describes the target");
+        println!("=== timing {host} through the TV (SetAVTransportURI, unauthenticated) ===");
+        println!("    the fault code (716) is decided from the URI shape *before* the fetch, so it");
+        println!("    is useless as an oracle; the round-trip TIME is not - a closed port refuses");
+        println!("    at once, an open one completes a handshake, a silent host makes the TV wait.");
+        // Path ends in .mp4 so the URI passes the format check and the TV actually
+        // opens the socket; three samples per port, report the median.
+        let samples = 3u32;
         for p in ports {
-            let uri = format!("http://{host}:{p}/");
-            let t0 = Instant::now();
-            let (c, raw) = tv.av(
-                "SetAVTransportURI",
-                &format!("<CurrentURI>{}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>",
-                         xesc(&uri)),
-            );
-            let ms = t0.elapsed().as_millis();
-            let code = tag(&raw, "errorCode").unwrap_or("-");
-            let verdict = match (c, code) {
-                (200, _) => "OPEN - the TV got an answer it accepted",
-                (_, "716") => "reachable, but not playable content",
-                (_, "714") => "reachable, unsupported media type",
-                (_, "701") => "reachable (transition refused)",
-                _ if ms > 2500 => "no answer (filtered/timeout)",
-                _ => "refused/closed",
+            let uri = format!("http://{host}:{p}/probe.mp4");
+            let mut ts: Vec<u128> = Vec::new();
+            for _ in 0..samples {
+                let t0 = Instant::now();
+                let _ = tv.av(
+                    "SetAVTransportURI",
+                    &format!("<CurrentURI>{}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>",
+                             xesc(&uri)),
+                );
+                ts.push(t0.elapsed().as_millis());
+            }
+            ts.sort();
+            let med = ts[ts.len() / 2];
+            let verdict = if med >= 2500 {
+                "SILENT  - host up, port dropped (no RST) or no host"
+            } else if med >= 120 {
+                "SLOW    - a real handshake completed here"
+            } else {
+                "fast    - refused/closed"
             };
-            println!("    {host}:{p:<5} HTTP {c:<4} upnp={code:<4} {ms:>5}ms  {verdict}");
+            println!("    {host}:{p:<5} median {med:>5}ms  [{}]  {verdict}",
+                     ts.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
         }
-        println!("\nEverything above was fetched by the TV, from the TV's vantage point.");
+        println!("\nSLOW ports answered the TV; SILENT ports swallowed its SYN; fast ones refused.");
         return;
     }
 
