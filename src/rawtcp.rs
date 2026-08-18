@@ -25,6 +25,20 @@ use std::time::{Duration, Instant};
 const AF_PACKET: libc::c_int = 17;
 const SOCK_RAW: libc::c_int = 3;
 const ETH_P_ALL: u16 = 0x0003;
+
+// Promiscuous membership. Declared here rather than taken from libc so the
+// tier-3 mips musl target cannot fail to build on a missing constant.
+const SOL_PACKET: libc::c_int = 263;
+const PACKET_ADD_MEMBERSHIP: libc::c_int = 1;
+const PACKET_MR_PROMISC: u16 = 1;
+
+#[repr(C)]
+struct PacketMreq {
+    mr_ifindex: libc::c_int,
+    mr_type: u16,
+    mr_alen: u16,
+    mr_address: [u8; 8],
+}
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_ARP: u16 = 0x0806;
 
@@ -128,6 +142,20 @@ impl Raw {
             let e = io::Error::last_os_error();
             unsafe { libc::close(fd) };
             return Err(e);
+        }
+        // Go promiscuous. The replies we care about are addressed to a MAC the
+        // kernel does not own, so without this they are dropped before reaching
+        // the socket and every handshake reads as "no SYN/ACK" - the TV was
+        // answering all along. This was masked for a long time by running
+        // tcpdump alongside, which put br0 in promiscuous mode for us: every run
+        // with a capture completed, every run without one failed.
+        let mut mr: PacketMreq = unsafe { mem::zeroed() };
+        mr.mr_ifindex = ifindex;
+        mr.mr_type = PACKET_MR_PROMISC;
+        unsafe {
+            libc::setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP,
+                             &mr as *const _ as *const libc::c_void,
+                             mem::size_of::<PacketMreq>() as u32);
         }
         let tv = libc::timeval { tv_sec: 0, tv_usec: 200_000 };
         unsafe {
