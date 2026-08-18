@@ -708,6 +708,8 @@ fn usage() {
   --dial-arg <s>     launch parameters passed to the app, e.g. \"v=<videoid>\"
   --dial-stop        DELETE <App>/run instead of launching
   --dial-port <n>    DIAL port                                 (default 8080)
+  --ssdp [ST]        M-SEARCH the LAN for UPnP devices; default ST is
+                     RenderingControl, pass ssdp:all to see everything
   --req <METHOD>     arbitrary request; needs --url, optional --body / --ct
   --banner <h:port>  connect to a port that is not HTTP and show what it says;
                      optional --send prods it first (backslash r/n understood)
@@ -871,6 +873,56 @@ fn run() {
             }
             Some(v) => println!("SetVolume did not take effect (read back {v}); see the codes above."),
             None => println!("could not read the volume back."),
+        }
+        return;
+    }
+
+    // --ssdp: who else on the LAN speaks UPnP? The TV refuses SetVolume with 501
+    // because dmr's updateSpeakerInfo maps the current Sound Output to a speaker
+    // object and everything except TV Speaker (case 0, plus 2/3/4) lands on
+    // NonSupportedSpeaker - so the audio is going somewhere else. If that sink is
+    // a networked speaker or soundbar it will answer here, and its own
+    // RenderingControl is then the way to control the volume.
+    if args.has("--ssdp") {
+        let target = args.val("--ssdp")
+            .unwrap_or_else(|| "urn:schemas-upnp-org:service:RenderingControl:1".into());
+        println!("=== SSDP M-SEARCH for {target} ===");
+        let sock = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => { eprintln!("bind: {e}"); return; }
+        };
+        let _ = sock.set_read_timeout(Some(Duration::from_secs(1)));
+        let _ = sock.set_broadcast(true);
+        let msg = format!(
+            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n\
+             MAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {target}\r\n\r\n"
+        );
+        for _ in 0..3 {
+            let _ = sock.send_to(msg.as_bytes(), "239.255.255.250:1900");
+        }
+        let mut seen: Vec<String> = Vec::new();
+        let mut buf = [0u8; 2048];
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(6) {
+            let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+            let txt = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let mut loc = String::new();
+            let mut server = String::new();
+            let mut st = String::new();
+            for line in txt.lines() {
+                let low = line.to_ascii_lowercase();
+                if let Some(v) = low.strip_prefix("location:") { loc = line[line.len() - v.trim_start().len()..].trim().to_string(); }
+                else if let Some(v) = low.strip_prefix("server:") { server = line[line.len() - v.trim_start().len()..].trim().to_string(); }
+                else if let Some(v) = low.strip_prefix("st:") { st = line[line.len() - v.trim_start().len()..].trim().to_string(); }
+            }
+            let key = format!("{}|{loc}", from.ip());
+            if seen.contains(&key) { continue; }
+            seen.push(key);
+            println!("  {} \n    ST:       {st}\n    LOCATION: {loc}\n    SERVER:   {server}",
+                     from.ip());
+        }
+        if seen.is_empty() {
+            println!("  nothing answered - try --ssdp ssdp:all, or the sink is not on the network");
         }
         return;
     }
