@@ -710,7 +710,7 @@ fn usage() {
   --dial-port <n>    DIAL port                                 (default 8080)
   --req <METHOD>     arbitrary request; needs --url, optional --body / --ct
   --banner <h:port>  connect to a port that is not HTTP and show what it says;
-                     optional --send "raw\r\n" to prod it first
+                     optional --send prods it first (backslash r/n understood)
   --stop             Stop playback + disable the caption, then exit
   --no-caption       A/B control: same media, no subtitle bound
   --ctrl-caption     also fire X_ControlCaption(Enable) during playback
