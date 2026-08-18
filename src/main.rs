@@ -708,6 +708,8 @@ fn usage() {
   --dial-arg <s>     launch parameters passed to the app, e.g. \"v=<videoid>\"
   --dial-stop        DELETE <App>/run instead of launching
   --dial-port <n>    DIAL port                                 (default 8080)
+  --soap <ctrlURL>   call any UPnP action; needs --ns and --action, optional
+                     --args with the inner XML
   --ssdp [ST]        M-SEARCH the LAN for UPnP devices; default ST is
                      RenderingControl, pass ssdp:all to see everything
   --req <METHOD>     arbitrary request; needs --url, optional --body / --ct
@@ -873,6 +875,52 @@ fn run() {
             }
             Some(v) => println!("SetVolume did not take effect (read back {v}); see the codes above."),
             None => println!("could not read the volume back."),
+        }
+        return;
+    }
+
+    // --soap: call any UPnP action on any service, because the TV turned out to
+    // run more of them than the two hard-coded here - SSDP lists a DIAL receiver
+    // on 7678 and urn:samsung.com:service:ScreenSharingService:1 on 9119, served
+    // by the separate screen_sharing daemon rather than by dmr, so dmr's ACL and
+    // its speaker gate do not apply there. Unlike tv.av()/tv.rc() this does not
+    // inject <InstanceID>, since these services do not take one.
+    if args.has("--soap") {
+        let url = args.val("--soap").unwrap_or_default();
+        let ns = args.val("--ns").unwrap_or_default();
+        let action = args.val("--action").unwrap_or_default();
+        let inner = args.val("--args").unwrap_or_default();
+        if url.is_empty() || ns.is_empty() || action.is_empty() {
+            eprintln!("--soap <controlURL> needs --ns <serviceType> --action <Name> [--args <xml>]");
+            return;
+        }
+        let envelope = format!(
+            "<?xml version=\"1.0\"?>\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>\
+<u:{action} xmlns:u=\"{ns}\">{inner}</u:{action}></s:Body></s:Envelope>"
+        );
+        let soapaction = format!("\"{ns}#{action}\"");
+        println!("=== {action} on {url} ===");
+        let r = if let Some(sp) = spoof() {
+            let u = parse_url(&url).expect("bad control url");
+            let (host, port, path) = (u.host.to_string(), u.port, u.path.to_string());
+            rawtcp::http_post(sp, &host, port, &path,
+                              &[("Content-Type", "text/xml; charset=\"utf-8\""),
+                                ("SOAPACTION", &soapaction)],
+                              envelope.as_bytes())
+        } else {
+            http_post(&url,
+                      &[("Content-Type", "text/xml; charset=\"utf-8\""),
+                        ("SOAPACTION", &soapaction)],
+                      envelope.as_bytes())
+        };
+        match r {
+            Ok((c, b)) => {
+                println!("HTTP {c}");
+                println!("{}", &b[..b.len().min(1500)]);
+            }
+            Err(e) => println!("failed: {e}"),
         }
         return;
     }
