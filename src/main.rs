@@ -771,6 +771,7 @@ fn run() {
                 src_mac: rawtcp::parse_mac(&m),
                 src_ip: rawtcp::parse_ip(&src_ip),
                 dst_mac,
+                dst_ip: rawtcp::parse_ip(&tv_ip),
             });
         }
         // Keep the spoofed IP resolvable for the whole run so the TV can always

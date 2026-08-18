@@ -63,6 +63,8 @@ pub struct Spoof {
     pub src_mac: [u8; 6],
     pub src_ip: [u8; 4],
     pub dst_mac: [u8; 6],
+    /// The peer, so the keepalive thread can address ARP requests at it.
+    pub dst_ip: [u8; 4],
 }
 
 pub fn parse_mac(s: &str) -> [u8; 6] {
@@ -343,7 +345,7 @@ pub fn resolve(iface: &str, src_mac: [u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4])
 {
     let raw = Raw::open(iface)?;
     let bcast = [0xffu8; 6];
-    let c = Conn { sp: &Spoof { iface: iface.into(), src_mac, src_ip, dst_mac: bcast },
+    let c = Conn { sp: &Spoof { iface: iface.into(), src_mac, src_ip, dst_mac: bcast, dst_ip },
                    dst_ip, sport: 0, dport: 0 };
     let mut buf = vec![0u8; 2048];
     for _ in 0..8 {
@@ -384,7 +386,7 @@ pub fn spawn_arp_responder(sp: &Spoof) {
         .stack_size(64 * 1024)
         .spawn(move || {
             let Ok(raw) = Raw::open(&sp.iface) else { return };
-            let c = Conn { sp: &sp, dst_ip: [0; 4], sport: 0, dport: 0 };
+            let c = Conn { sp: &sp, dst_ip: sp.dst_ip, sport: 0, dport: 0 };
             let mut buf = vec![0u8; 2048];
             // initial burst so the cache is warm before the first SYN
             for _ in 0..3 {
@@ -396,7 +398,16 @@ pub fn spawn_arp_responder(sp: &Spoof) {
                     c.answer_arp(&raw, &buf[..n]);
                 }
                 if last.elapsed() >= Duration::from_secs(3) {
+                    // A gratuitous *reply* refreshes an entry that already
+                    // exists but does not create one - receivers ignore
+                    // unsolicited replies for unknown addresses. A *request*
+                    // does create it: the sender fields of any ARP request
+                    // aimed at us must be learned. That is why a heavily used
+                    // fake identity stays reachable while a fresh one goes
+                    // silent after an idle window - it aged out of the peer's
+                    // table and the replies could not bring it back. Send both.
                     raw.send(&c.arp([0xff; 6], sp.src_ip, true));
+                    raw.send(&c.arp(sp.dst_mac, sp.dst_ip, false));
                     last = Instant::now();
                 }
             }
