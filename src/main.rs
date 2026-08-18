@@ -887,10 +887,16 @@ fn run() {
         let target = args.val("--ssdp")
             .unwrap_or_else(|| "urn:schemas-upnp-org:service:RenderingControl:1".into());
         println!("=== SSDP M-SEARCH for {target} ===");
-        let sock = match UdpSocket::bind("0.0.0.0:0") {
+        // Bind to our LAN address, not 0.0.0.0: this router has a dozen
+        // interfaces and an unbound socket sends the multicast out whichever one
+        // the route table picks first (the WAN), so nothing on the LAN ever sees
+        // the M-SEARCH and even the TV stays silent.
+        let local = my_ip(&tv_ip).unwrap_or_else(|_| "0.0.0.0".into());
+        let sock = match UdpSocket::bind((local.as_str(), 0)) {
             Ok(s) => s,
-            Err(e) => { eprintln!("bind: {e}"); return; }
+            Err(e) => { eprintln!("bind {local}: {e}"); return; }
         };
+        println!("    searching from {local}");
         let _ = sock.set_read_timeout(Some(Duration::from_secs(1)));
         let _ = sock.set_broadcast(true);
         let msg = format!(
