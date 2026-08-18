@@ -466,12 +466,14 @@ pub fn http_post(
     }
 
     let mut resp = Vec::new();
+    let mut peer_rst = false;
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(10) {
         let Some(n) = raw.recv(&mut buf) else { continue };
         c.answer_arp(&raw, &buf[..n]);
         let Some((s, fl, pl)) = c.parse(&buf[..n]) else { continue };
         if fl & RST != 0 {
+            peer_rst = true;
             break;
         }
         if !pl.is_empty() {
@@ -483,11 +485,28 @@ pub fn http_post(
         }
         if fl & FIN != 0 {
             ack = ack.wrapping_add(1);
-            raw.send(&c.tcp(seq, ack, ACK, &[]));
             break;
         }
     }
-    raw.send(&c.tcp(seq, ack, RST, &[]));
+    // Graceful FIN close instead of a RST. A burst of RST-torn connections is the
+    // anomaly the TV's AllShare server auto-bans on: after ~a dozen such control
+    // calls it starts answering 401 Unauthorized to that controller MAC, even a
+    // brand-new one. Close like a real control point does - our FIN also ACKs the
+    // peer's FIN (ack was advanced above) - then absorb its final ACK. Skip it if
+    // the peer already reset.
+    if !peer_rst {
+        raw.send(&c.tcp(seq, ack, FIN | ACK, &[]));
+        let tc = Instant::now();
+        while tc.elapsed() < Duration::from_millis(300) {
+            let Some(n) = raw.recv(&mut buf) else { continue };
+            c.answer_arp(&raw, &buf[..n]);
+            if let Some((_, fl, _)) = c.parse(&buf[..n]) {
+                if fl & (ACK | RST) != 0 {
+                    break;
+                }
+            }
+        }
+    }
 
     let text = String::from_utf8_lossy(&resp).into_owned();
     let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
