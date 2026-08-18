@@ -708,6 +708,9 @@ fn usage() {
   --dial-arg <s>     launch parameters passed to the app, e.g. \"v=<videoid>\"
   --dial-stop        DELETE <App>/run instead of launching
   --dial-port <n>    DIAL port                                 (default 8080)
+  --req <METHOD>     arbitrary request; needs --url, optional --body / --ct
+  --banner <h:port>  connect to a port that is not HTTP and show what it says;
+                     optional --send "raw\r\n" to prod it first
   --stop             Stop playback + disable the caption, then exit
   --no-caption       A/B control: same media, no subtitle bound
   --ctrl-caption     also fire X_ControlCaption(Enable) during playback
@@ -868,6 +871,71 @@ fn run() {
             }
             Some(v) => println!("SetVolume did not take effect (read back {v}); see the codes above."),
             None => println!("could not read the volume back."),
+        }
+        return;
+    }
+
+    // --req: arbitrary method/URL/body, because the surface keeps needing verbs
+    // and content types the router's busybox cannot produce (no nc, wget forces
+    // x-www-form-urlencoded and cannot DELETE or PUT).
+    if args.has("--req") {
+        let method = args.val("--req").unwrap_or_else(|| "GET".into());
+        let Some(url) = args.val("--url") else {
+            eprintln!("--req needs --url");
+            return;
+        };
+        let body = args.val("--body").unwrap_or_default();
+        let ct = args.val("--ct").unwrap_or_else(|| "text/plain; charset=utf-8".into());
+        let hdrs: Vec<(&str, &str)> =
+            if body.is_empty() { vec![] } else { vec![("Content-Type", ct.as_str())] };
+        match http_request(&method, &url, &hdrs, body.as_bytes()) {
+            Ok((c, b)) => {
+                println!("{method} {url} -> HTTP {c}");
+                if !b.is_empty() {
+                    println!("{}", &b[..b.len().min(1200)]);
+                }
+            }
+            Err(e) => println!("{method} {url} -> {e}"),
+        }
+        return;
+    }
+
+    // --banner: some ports accept a connection and then say nothing over HTTP
+    // (15500 here), which means a protocol that is not HTTP. Connect, optionally
+    // send something, and show whatever comes back as text and hex.
+    if args.has("--banner") {
+        let target = args.val("--banner").unwrap_or_else(|| format!("{tv_ip}:15500"));
+        let send = args.val("--send").unwrap_or_default();
+        println!("=== banner {target} ===");
+        let addr = match target.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+            Some(a) => a,
+            None => { eprintln!("cannot resolve {target}"); return; }
+        };
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+            Ok(mut s) => {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+                if !send.is_empty() {
+                    let raw = send.replace("\\r", "\r").replace("\\n", "\n");
+                    let _ = s.write_all(raw.as_bytes());
+                    let _ = s.flush();
+                    println!("    sent {} bytes", raw.len());
+                }
+                let mut buf = [0u8; 1024];
+                match s.read(&mut buf) {
+                    Ok(0) => println!("    peer closed without sending anything"),
+                    Ok(n) => {
+                        let txt: String = buf[..n].iter()
+                            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                            .collect();
+                        print!("    hex:");
+                        for b in &buf[..n.min(48)] { print!(" {b:02x}"); }
+                        println!("\n    txt: {txt}");
+                        println!("    ({n} bytes)");
+                    }
+                    Err(e) => println!("    connected, but nothing arrived: {e}"),
+                }
+            }
+            Err(e) => println!("    connect failed: {e}"),
         }
         return;
     }
