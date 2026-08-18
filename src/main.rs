@@ -692,6 +692,8 @@ fn usage() {
   --no-caption       A/B control: same media, no subtitle bound
   --ctrl-caption     also fire X_ControlCaption(Enable) during playback
   --remote [url]     point the TV at a remote clip, bypassing our server
+  --probe            after loading the URI, fire every action that could start
+                     playback and report which ones the ACL refuses (705)
   --nopoll           do not poll the renderer while it streams
   --loop <seconds>   repeat the whole cycle forever, sleeping in between
   --spoof-mac <mac>  send SOAP from this MAC via raw frames (bypasses the
@@ -954,6 +956,44 @@ fn run() {
         "[1] SetAVTransportURI (+sec:CaptionInfoEx) -> HTTP {c}{}",
         if c == 200 { "  OK".to_string() } else { format!("\n    {}", &raw[..raw.len().min(300)]) }
     );
+
+    // --probe: which AVTransport actions are actually ACL-gated?
+    //
+    // dmr's aPlay calls DMRAcl::askAclPolicy -> rdm_request_access, which puts a
+    // consent dialog on screen and records a DENY when it times out; that is why
+    // Play answers 705 "Transport is locked" (log line "DMR_ACL_DENY") for every
+    // controller we have used. DMRAcl::getAclPolicy, though, checks the action
+    // name against a list and falls through to "permited - action not included
+    // into checking list" -> allowed. So an action outside that list is served
+    // without consent. Fire each candidate and read the code: 705 means the ACL
+    // refused, while 402/501/500-with-another-code means it got past the ACL and
+    // only the arguments or the state were wrong.
+    if args.has("--probe") {
+        println!("[2] probing which actions the ACL gates (705 = denied, other = passed ACL)");
+        let probes: [(&str, &str); 9] = [
+            ("Play", "<Speed>1</Speed>"),
+            ("Next", ""),
+            ("Previous", ""),
+            ("Seek", "<Unit>REL_TIME</Unit><Target>0:00:03</Target>"),
+            ("Pause", ""),
+            ("SetPlayMode", "<NewPlayMode>NORMAL</NewPlayMode>"),
+            ("X_PrefetchURI", &""),
+            ("X_SetTVSlideShow", "<TVSlideShow>ON</TVSlideShow>"),
+            ("X_PlayerAppHint", "<PlayerAppHint>1</PlayerAppHint>"),
+        ];
+        for (action, inner) in probes {
+            let (c, raw) = tv.av(action, inner);
+            let code = tag(&raw, "errorCode").unwrap_or("-");
+            let desc = tag(&raw, "errorDescription").unwrap_or("");
+            println!(
+                "    {action:<22} HTTP {c:<4} upnp={code:<5} {desc}{}",
+                if code == "705" { "   <- ACL DENIED" } else if c == 200 { "   <- ACCEPTED" } else { "   <- past the ACL" }
+            );
+            thread::sleep(Duration::from_millis(400));
+        }
+        println!("\nAny line that is not 705 reached the handler, i.e. the ACL did not gate it.");
+        return;
+    }
 
     let (c, raw) = tv.av("Play", "<Speed>1</Speed>");
     println!(
