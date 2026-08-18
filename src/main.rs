@@ -913,6 +913,28 @@ fn run() {
         if args.has("--remote") { "" } else { &res_attrs },
     );
 
+    // The DLNA service goes cold when the TV is idle: the first control exchange
+    // after that returns HTTP 0 (the TV is not answering ARP/SYN yet) but wakes
+    // the service, so the next succeeds. Do that throwaway exchange here so the
+    // real sequence below always lands on a warm service instead of losing its
+    // Stop. When the TV is already warm the first probe returns 200 and this
+    // costs nothing.
+    for i in 1..=5 {
+        let (c, _) = tv.av("GetTransportInfo", "");
+        if c != 0 {
+            if i > 1 {
+                println!("[0a] DLNA service woke after {i} probe(s)");
+            }
+            break;
+        }
+        if i == 5 {
+            println!("[0a] TV did not answer 5 probes - likely deep standby (screen fully off)");
+        } else {
+            println!("[0a] warming up DLNA service (probe {i}/5, TV idle)...");
+            thread::sleep(Duration::from_millis(700));
+        }
+    }
+
     // Clear any stale session: a previous run leaves the renderer STOPPED with the
     // old TrackURI loaded, and control points are expected to Stop first.
     let (c, _) = tv.av("Stop", "");
