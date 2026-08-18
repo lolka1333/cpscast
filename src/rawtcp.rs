@@ -395,8 +395,20 @@ pub fn http_post(
     req.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()));
     let mut pkt = req.into_bytes();
     pkt.extend_from_slice(body);
-    raw.send(&c.tcp(seq, ack, PSH | ACK, &pkt));
-    seq = seq.wrapping_add(pkt.len() as u32);
+    // Segment the request: SetAVTransportURI carries a big DIDL blob (>2 KB), and
+    // one frame cannot exceed the ~1460-byte TCP MSS. Sending it whole made the
+    // frame oversized and it was dropped -> HTTP 0. Split into MSS-sized segments;
+    // the window (64240) is large enough to send them back-to-back, only the last
+    // one PSH. GetTransportInfo etc. are one segment, so this is a no-op for them.
+    const MSS: usize = 1460;
+    let mut off = 0;
+    while off < pkt.len() {
+        let end = (off + MSS).min(pkt.len());
+        let flags = if end == pkt.len() { PSH | ACK } else { ACK };
+        raw.send(&c.tcp(seq, ack, flags, &pkt[off..end]));
+        seq = seq.wrapping_add((end - off) as u32);
+        off = end;
+    }
 
     let mut resp = Vec::new();
     let t0 = Instant::now();

@@ -1,3 +1,7 @@
 /target
 /captioncast
 /macspoof
+*.exe
+*.zip
+*.img
+platform.img
