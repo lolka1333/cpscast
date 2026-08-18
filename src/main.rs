@@ -873,11 +873,12 @@ fn run() {
             // NonSupportedSpeaker, whose setVolume fails -> 501. Only case 0,
             // "TV Speaker", accepts volume control, and RenderingControl exposes no
             // action to switch the output, so it cannot be forced remotely.
-            println!("    501 here is a firmware gate, not a failure of the PoC: volume control");
-            println!("    only works while Sound Output = TV Speaker. External speaker, BT");
-            println!("    headset and dual BT all map to NonSupportedSpeaker in dmr, and no");
-            println!("    DLNA action can change the output. To exercise it: TV Settings ->");
-            println!("    Sound -> Sound Output -> TV Speaker, then re-run.");
+            println!("    501 is the access check, not the sound path. RCSImpl::aSetVolume tests");
+            println!("    the ACL first and logs \"ACL != PERMITTED - action failed\" before it ever");
+            println!("    reaches SoundControlApi::setVolume; getAclPolicy answers 2 (\"unknown\")");
+            println!("    for a device the TV has never approved, and unknown is not permitted.");
+            println!("    Volume needs the same approval Play does - the sound-output theory was");
+            println!("    wrong (that is the *inner* 501, only reachable once the ACL passes).");
         }
 
         if args.has("--mute") {
