@@ -399,7 +399,9 @@ fn cbor(b: &[u8], i: &mut usize, out: &mut String, depth: usize) {
 
 /// One CoAP GET over UDP. OCF discovery (/oic/res, /oic/d, /oic/p) is unsecured
 /// by specification, so this needs no key material.
-fn coap_get(target: &str, port: u16, path: &str, query: &str) -> std::io::Result<(u8, Vec<u8>)> {
+fn coap_get(target: &str, port: u16, path: &str, query: &str, accept: Option<u32>)
+    -> std::io::Result<(u8, Vec<u8>)>
+{
     let s = UdpSocket::bind("0.0.0.0:0")?;
     s.set_read_timeout(Some(Duration::from_secs(4)))?;
     let mut m = Vec::with_capacity(64);
@@ -422,7 +424,15 @@ fn coap_get(target: &str, port: u16, path: &str, query: &str) -> std::io::Result
     for seg in path.split('/').filter(|s| !s.is_empty()) {
         opt(&mut m, 11, seg.as_bytes(), &mut last);
     }
-    opt(&mut m, 17, &10000u16.to_be_bytes(), &mut last); // Accept: vnd.ocf+cbor
+    // Accept is optional: the TV answers 4.06 Not Acceptable to
+    // application/vnd.ocf+cbor (10000), so let the caller pick, or omit it
+    // entirely and take whatever the device prefers.
+    match accept {
+        Some(0) => {}
+        Some(a) if a < 256 => opt(&mut m, 17, &[a as u8], &mut last),
+        Some(a) => opt(&mut m, 17, &(a as u16).to_be_bytes(), &mut last),
+        None => {}
+    }
     if !query.is_empty() {
         for q in query.split('&').filter(|s| !s.is_empty()) {
             opt(&mut m, 15, q.as_bytes(), &mut last);
@@ -923,6 +933,8 @@ fn usage() {
   --status           read-only: transport + caption state, then exit
   --coap [path]      CoAP GET over UDP (default /oic/res); OCF discovery is
                      unsecured by spec   --coap-port / --coap-query
+  --coap-accept <n>  content-format to ask for; omit to send no Accept at all
+                     (60 = application/cbor, 10000 = vnd.ocf+cbor)
   --proto <ip:port>  identify a non-HTTP service by trying the usual
                      protocol hellos and printing what answers
   --xxe [ctrlURL]    probe the SOAP parsers for external-entity handling;
@@ -1101,7 +1113,8 @@ fn run() {
         let port: u16 = args.val("--coap-port").and_then(|v| v.parse().ok()).unwrap_or(5683);
         let query = args.val("--coap-query").unwrap_or_default();
         println!("=== CoAP GET coap://{tv_ip}:{port}{path} {query} ===");
-        match coap_get(&tv_ip, port, &path, &query) {
+        let accept = args.val("--coap-accept").and_then(|v| v.parse::<u32>().ok());
+        match coap_get(&tv_ip, port, &path, &query, accept) {
             Ok((code, payload)) => {
                 println!("    code {}.{:02}   payload {} bytes",
                          code >> 5, code & 0x1f, payload.len());
