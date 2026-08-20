@@ -317,6 +317,147 @@ fn ua() -> Option<&'static String> {
     unsafe { UA.as_ref() }
 }
 
+/// Pretty-print CBOR far enough to read an OCF payload: maps, arrays, strings,
+/// numbers, and the indefinite-length forms these stacks like to emit.
+fn cbor(b: &[u8], i: &mut usize, out: &mut String, depth: usize) {
+    if *i >= b.len() || depth > 12 {
+        return;
+    }
+    let ib = b[*i];
+    *i += 1;
+    let major = ib >> 5;
+    let ai = ib & 0x1f;
+    let mut len: u64 = ai as u64;
+    let indefinite = ai == 31;
+    if !indefinite {
+        match ai {
+            24 => { if *i < b.len() { len = b[*i] as u64; *i += 1; } }
+            25 => { if *i + 1 < b.len() { len = u16::from_be_bytes([b[*i], b[*i+1]]) as u64; *i += 2; } }
+            26 => { if *i + 3 < b.len() { len = u32::from_be_bytes([b[*i],b[*i+1],b[*i+2],b[*i+3]]) as u64; *i += 4; } }
+            27 => { if *i + 7 < b.len() {
+                        let mut v = [0u8; 8];
+                        v.copy_from_slice(&b[*i..*i+8]);
+                        len = u64::from_be_bytes(v); *i += 8; } }
+            _ => {}
+        }
+    }
+    match major {
+        0 => out.push_str(&len.to_string()),
+        1 => out.push_str(&format!("-{}", len as i64 + 1)),
+        2 => {
+            let n = (len as usize).min(b.len().saturating_sub(*i));
+            let hex: String = b[*i..*i+n].iter().map(|x| format!("{x:02x}")).collect();
+            out.push_str(&format!("hex({hex})"));
+            *i += n;
+        }
+        3 => {
+            let n = (len as usize).min(b.len().saturating_sub(*i));
+            out.push('"');
+            out.push_str(&String::from_utf8_lossy(&b[*i..*i+n]));
+            out.push('"');
+            *i += n;
+        }
+        4 => {
+            out.push('[');
+            let mut k = 0u64;
+            loop {
+                if indefinite {
+                    if *i < b.len() && b[*i] == 0xff { *i += 1; break; }
+                } else if k >= len { break; }
+                if *i >= b.len() { break; }
+                if k > 0 { out.push_str(", "); }
+                cbor(b, i, out, depth + 1);
+                k += 1;
+            }
+            out.push(']');
+        }
+        5 => {
+            out.push('{');
+            let mut k = 0u64;
+            loop {
+                if indefinite {
+                    if *i < b.len() && b[*i] == 0xff { *i += 1; break; }
+                } else if k >= len { break; }
+                if *i >= b.len() { break; }
+                if k > 0 { out.push_str(", "); }
+                cbor(b, i, out, depth + 1);
+                out.push_str(": ");
+                cbor(b, i, out, depth + 1);
+                k += 1;
+            }
+            out.push('}');
+        }
+        7 => match ai {
+            20 => out.push_str("false"),
+            21 => out.push_str("true"),
+            22 => out.push_str("null"),
+            _ => out.push_str(&format!("simple({ai})")),
+        },
+        _ => out.push_str(&format!("tag({len})")),
+    }
+}
+
+/// One CoAP GET over UDP. OCF discovery (/oic/res, /oic/d, /oic/p) is unsecured
+/// by specification, so this needs no key material.
+fn coap_get(target: &str, port: u16, path: &str, query: &str) -> std::io::Result<(u8, Vec<u8>)> {
+    let s = UdpSocket::bind("0.0.0.0:0")?;
+    s.set_read_timeout(Some(Duration::from_secs(4)))?;
+    let mut m = Vec::with_capacity(64);
+    m.push(0x40 | 0x02); // ver 1, CON, token length 2
+    m.push(0x01);        // GET
+    m.extend_from_slice(&0x1234u16.to_be_bytes());
+    m.extend_from_slice(&[0xAB, 0xCD]);
+    let mut last = 0u16;
+    fn opt(m: &mut Vec<u8>, num: u16, val: &[u8], last: &mut u16) {
+        let delta = num - *last;
+        *last = num;
+        let (d, dext) = if delta < 13 { (delta as u8, None) } else { (13u8, Some((delta - 13) as u8)) };
+        let l = val.len();
+        let (ln, lext) = if l < 13 { (l as u8, None) } else { (13u8, Some((l - 13) as u8)) };
+        m.push((d << 4) | ln);
+        if let Some(x) = dext { m.push(x); }
+        if let Some(x) = lext { m.push(x); }
+        m.extend_from_slice(val);
+    }
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        opt(&mut m, 11, seg.as_bytes(), &mut last);
+    }
+    opt(&mut m, 17, &10000u16.to_be_bytes(), &mut last); // Accept: vnd.ocf+cbor
+    if !query.is_empty() {
+        for q in query.split('&').filter(|s| !s.is_empty()) {
+            opt(&mut m, 15, q.as_bytes(), &mut last);
+        }
+    }
+    s.send_to(&m, (target, port))?;
+    let mut buf = vec![0u8; 8192];
+    let (n, _) = s.recv_from(&mut buf)?;
+    buf.truncate(n);
+    if n < 4 {
+        return Ok((0, buf));
+    }
+    let code = buf[1];
+    let tkl = (buf[0] & 0x0f) as usize;
+    let mut i = 4 + tkl;
+    while i < buf.len() {
+        if buf[i] == 0xff { i += 1; break; }
+        let hdr = buf[i];
+        let d = (hdr >> 4) as usize;
+        let l = (hdr & 0x0f) as usize;
+        i += 1;
+        if d == 13 { i += 1; } else if d == 14 { i += 2; }
+        let mut ll = l;
+        if l == 13 {
+            if i < buf.len() { ll = buf[i] as usize + 13; }
+            i += 1;
+        } else if l == 14 {
+            if i + 1 < buf.len() { ll = u16::from_be_bytes([buf[i], buf[i+1]]) as usize + 269; }
+            i += 2;
+        }
+        i += ll;
+    }
+    Ok((code, buf[i.min(buf.len())..].to_vec()))
+}
+
 /// Minimal base64 for the `name=` parameter the remote channel demands.
 fn b64(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -780,6 +921,8 @@ fn usage() {
   --media <path>     mp4 to serve, faststart    (default ./media.mp4)
   --port <n>         local HTTP port            (default {DEFAULT_PORT})
   --status           read-only: transport + caption state, then exit
+  --coap [path]      CoAP GET over UDP (default /oic/res); OCF discovery is
+                     unsecured by spec   --coap-port / --coap-query
   --proto <ip:port>  identify a non-HTTP service by trying the usual
                      protocol hellos and printing what answers
   --xxe [ctrlURL]    probe the SOAP parsers for external-entity handling;
@@ -947,6 +1090,33 @@ fn run() {
     // guess one preamble at a time by hand, send the usual suspects and print
     // whatever comes back, as text and as hex - the first bytes of a reply are
     // usually enough to name a protocol.
+    // --coap: the TLS ports carry certificates reading "CN=OCF Device: 2017_TV /
+    // OU=OCF VD Device / O=Samsung Electronics", so the TV runs the same
+    // OCF/SmartThings stack as the washer. OCF discovery is unsecured by
+    // specification - /oic/res lists every resource the device publishes - and
+    // none of it goes through dmr's registry, which is what makes it worth a
+    // look now that every media path has dead-ended. GET only.
+    if args.has("--coap") {
+        let path = args.val("--coap").unwrap_or_else(|| "/oic/res".to_string());
+        let port: u16 = args.val("--coap-port").and_then(|v| v.parse().ok()).unwrap_or(5683);
+        let query = args.val("--coap-query").unwrap_or_default();
+        println!("=== CoAP GET coap://{tv_ip}:{port}{path} {query} ===");
+        match coap_get(&tv_ip, port, &path, &query) {
+            Ok((code, payload)) => {
+                println!("    code {}.{:02}   payload {} bytes",
+                         code >> 5, code & 0x1f, payload.len());
+                if !payload.is_empty() {
+                    let mut i = 0usize;
+                    let mut out = String::new();
+                    cbor(&payload, &mut i, &mut out, 0);
+                    println!("{}", &out[..out.len().min(4000)]);
+                }
+            }
+            Err(e) => println!("    no answer: {e}"),
+        }
+        return;
+    }
+
     if args.has("--proto") {
         let target = args.val("--proto").unwrap_or_else(|| format!("{tv_ip}:9999"));
         let addr = match target.to_socket_addrs().ok().and_then(|mut a| a.next()) {
