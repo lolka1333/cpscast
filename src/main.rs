@@ -455,7 +455,7 @@ fn coap_get(target: &str, port: u16, path: &str, query: &str, accept: Option<u32
     let (n, _) = s.recv_from(&mut buf)?;
     buf.truncate(n);
     if n < 4 {
-        return Ok((0, buf));
+        return Ok((0, buf, false));
     }
     let code = buf[1];
     let tkl = (buf[0] & 0x0f) as usize;
