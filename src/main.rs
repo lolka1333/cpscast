@@ -399,8 +399,9 @@ fn cbor(b: &[u8], i: &mut usize, out: &mut String, depth: usize) {
 
 /// One CoAP GET over UDP. OCF discovery (/oic/res, /oic/d, /oic/p) is unsecured
 /// by specification, so this needs no key material.
-fn coap_get(target: &str, port: u16, path: &str, query: &str, accept: Option<u32>)
-    -> std::io::Result<(u8, Vec<u8>)>
+fn coap_get(target: &str, port: u16, path: &str, query: &str, accept: Option<u32>,
+            block_num: u32)
+    -> std::io::Result<(u8, Vec<u8>, bool)>
 {
     let s = UdpSocket::bind("0.0.0.0:0")?;
     s.set_read_timeout(Some(Duration::from_secs(4)))?;
@@ -438,6 +439,17 @@ fn coap_get(target: &str, port: u16, path: &str, query: &str, accept: Option<u32
             opt(&mut m, 15, q.as_bytes(), &mut last);
         }
     }
+    // Block2 (option 23): NUM<<4 | SZX, SZX 6 = 1024 bytes, the size the TV
+    // already chose for us. Only sent past the first block, so the initial
+    // request stays exactly as it was.
+    if block_num > 0 {
+        let v = (block_num << 4) | 6;
+        if v < 256 {
+            opt(&mut m, 23, &[v as u8], &mut last);
+        } else {
+            opt(&mut m, 23, &(v as u16).to_be_bytes(), &mut last);
+        }
+    }
     s.send_to(&m, (target, port))?;
     let mut buf = vec![0u8; 8192];
     let (n, _) = s.recv_from(&mut buf)?;
@@ -448,13 +460,22 @@ fn coap_get(target: &str, port: u16, path: &str, query: &str, accept: Option<u32
     let code = buf[1];
     let tkl = (buf[0] & 0x0f) as usize;
     let mut i = 4 + tkl;
+    let mut num = 0u16;
+    let mut more = false;
     while i < buf.len() {
         if buf[i] == 0xff { i += 1; break; }
         let hdr = buf[i];
         let d = (hdr >> 4) as usize;
         let l = (hdr & 0x0f) as usize;
         i += 1;
-        if d == 13 { i += 1; } else if d == 14 { i += 2; }
+        let mut delta = d as u16;
+        if d == 13 {
+            if i < buf.len() { delta = buf[i] as u16 + 13; }
+            i += 1;
+        } else if d == 14 {
+            if i + 1 < buf.len() { delta = u16::from_be_bytes([buf[i], buf[i+1]]) + 269; }
+            i += 2;
+        }
         let mut ll = l;
         if l == 13 {
             if i < buf.len() { ll = buf[i] as usize + 13; }
@@ -463,9 +484,18 @@ fn coap_get(target: &str, port: u16, path: &str, query: &str, accept: Option<u32
             if i + 1 < buf.len() { ll = u16::from_be_bytes([buf[i], buf[i+1]]) as usize + 269; }
             i += 2;
         }
+        num += delta;
+        // Block2: the M bit says another block is waiting
+        if num == 23 && ll > 0 && i < buf.len() {
+            let mut v: u32 = 0;
+            for k in 0..ll.min(3) {
+                if i + k < buf.len() { v = (v << 8) | buf[i + k] as u32; }
+            }
+            more = (v & 0x08) != 0;
+        }
         i += ll;
     }
-    Ok((code, buf[i.min(buf.len())..].to_vec()))
+    Ok((code, buf[i.min(buf.len())..].to_vec(), more))
 }
 
 /// Minimal base64 for the `name=` parameter the remote channel demands.
@@ -1114,18 +1144,31 @@ fn run() {
         let query = args.val("--coap-query").unwrap_or_default();
         println!("=== CoAP GET coap://{tv_ip}:{port}{path} {query} ===");
         let accept = args.val("--coap-accept").and_then(|v| v.parse::<u32>().ok());
-        match coap_get(&tv_ip, port, &path, &query, accept) {
-            Ok((code, payload)) => {
-                println!("    code {}.{:02}   payload {} bytes",
-                         code >> 5, code & 0x1f, payload.len());
-                if !payload.is_empty() {
-                    let mut i = 0usize;
-                    let mut out = String::new();
-                    cbor(&payload, &mut i, &mut out, 0);
-                    println!("{}", &out[..out.len().min(4000)]);
+        // The TV answers in 1024-byte blocks, so keep asking until the More bit
+        // clears - the first reply alone cut the resource list in half.
+        let mut whole: Vec<u8> = Vec::new();
+        let mut blk = 0u32;
+        loop {
+            match coap_get(&tv_ip, port, &path, &query, accept, blk) {
+                Ok((code, payload, more)) => {
+                    if blk == 0 {
+                        println!("    code {}.{:02}", code >> 5, code & 0x1f);
+                    }
+                    whole.extend_from_slice(&payload);
+                    if !more || payload.is_empty() || blk > 32 {
+                        break;
+                    }
+                    blk += 1;
                 }
+                Err(e) => { println!("    no answer: {e}"); break; }
             }
-            Err(e) => println!("    no answer: {e}"),
+        }
+        println!("    {} bytes in {} block(s)", whole.len(), blk + 1);
+        if !whole.is_empty() {
+            let mut i = 0usize;
+            let mut out = String::new();
+            cbor(&whole, &mut i, &mut out, 0);
+            println!("{out}");
         }
         return;
     }
