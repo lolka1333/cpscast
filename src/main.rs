@@ -1075,6 +1075,7 @@ fn usage() {
   --ssdp [ST]        M-SEARCH the LAN for UPnP devices; default ST is
                      RenderingControl, pass ssdp:all to see everything
   --req <METHOD>     arbitrary request; needs --url, optional --body / --ct
+  --send-hex <hex>   raw bytes appended after --send, for binary bodies
   --banner <h:port>  connect to a port that is not HTTP and show what it says;
                      optional --send prods it first (backslash r/n understood)
   --stop             Stop playback + disable the caption, then exit
@@ -1857,6 +1858,22 @@ s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>\
                     let _ = s.write_all(raw.as_bytes());
                     let _ = s.flush();
                     println!("    sent {} bytes", raw.len());
+                }
+                // --send-hex appends raw bytes after --send: a TLV8 body is
+                // binary and cannot go through the text path above, and AirPlay's
+                // /pair-setup answers 400 to an empty POST.
+                if let Some(h) = args.val("--send-hex") {
+                    let hb: Vec<char> = h.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+                    let mut bytes = Vec::new();
+                    for pair in hb.chunks(2) {
+                        if pair.len() == 2 {
+                            let hs: String = pair.iter().collect();
+                            if let Ok(b) = u8::from_str_radix(&hs, 16) { bytes.push(b); }
+                        }
+                    }
+                    let _ = s.write_all(&bytes);
+                    let _ = s.flush();
+                    println!("    sent {} raw bytes", bytes.len());
                 }
                 let mut buf = [0u8; 1024];
                 match s.read(&mut buf) {
