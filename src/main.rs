@@ -780,6 +780,8 @@ fn usage() {
   --media <path>     mp4 to serve, faststart    (default ./media.mp4)
   --port <n>         local HTTP port            (default {DEFAULT_PORT})
   --status           read-only: transport + caption state, then exit
+  --scan [ip]        TCP connect scan; --from/--to bound the range,
+                     --threads and --scan-timeout tune it
   --ws               open the remote-control channel on :8001 and send a key;
                      that path reaches the input subsystem, not dmr
   --key <NAME>       key to send with --ws            (default KEY_VOLDOWN)
@@ -923,6 +925,59 @@ fn run() {
     // upgrade: ms.channel.connect means the session is live (and carries the
     // token, if one is issued), ms.channel.unauthorized means it wants the
     // on-screen approval instead.
+    // --scan: every service we found so far came from guessing port numbers or
+    // from SSDP, which is how 7678 and 9119 stayed hidden for a whole session.
+    // Enumerate the target properly instead: a plain TCP connect scan, a handful
+    // of threads, so the full list of listening services is known rather than
+    // assumed.
+    if args.has("--scan") {
+        let target = args.val("--scan").unwrap_or_else(|| tv_ip.clone());
+        let from: u16 = args.val("--from").and_then(|v| v.parse().ok()).unwrap_or(1);
+        let to: u16 = args.val("--to").and_then(|v| v.parse().ok()).unwrap_or(65535);
+        let ms: u64 = args.val("--scan-timeout").and_then(|v| v.parse().ok()).unwrap_or(400);
+        let nthreads: usize = args.val("--threads").and_then(|v| v.parse().ok()).unwrap_or(24);
+        println!("=== TCP scan {target} ports {from}-{to} ({nthreads} threads, {ms}ms) ===");
+
+        let next = Arc::new(AtomicUsize::new(from as usize));
+        let open: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut hs = Vec::new();
+        for _ in 0..nthreads {
+            let next = Arc::clone(&next);
+            let open = Arc::clone(&open);
+            let target = target.clone();
+            let h = thread::Builder::new()
+                .stack_size(64 * 1024)
+                .spawn(move || loop {
+                    let p = next.fetch_add(1, Ordering::Relaxed);
+                    if p > to as usize {
+                        break;
+                    }
+                    let port = p as u16;
+                    let addr = match (target.as_str(), port).to_socket_addrs().ok().and_then(|mut a| a.next()) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    if TcpStream::connect_timeout(&addr, Duration::from_millis(ms)).is_ok() {
+                        println!("    {port} open");
+                        if let Ok(mut o) = open.lock() {
+                            o.push(port);
+                        }
+                    }
+                });
+            if let Ok(h) = h {
+                hs.push(h);
+            }
+        }
+        for h in hs {
+            let _ = h.join();
+        }
+        let mut o = open.lock().map(|v| v.clone()).unwrap_or_default();
+        o.sort();
+        println!("\n{} open port(s): {}", o.len(),
+                 o.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "));
+        return;
+    }
+
     if args.has("--ws") {
         let port: u16 = args.val("--ws-port").and_then(|v| v.parse().ok()).unwrap_or(8001);
         let name = args.val("--ws-name").unwrap_or_else(|| "captioncast".to_string());
