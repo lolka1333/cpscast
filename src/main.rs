@@ -780,6 +780,8 @@ fn usage() {
   --media <path>     mp4 to serve, faststart    (default ./media.mp4)
   --port <n>         local HTTP port            (default {DEFAULT_PORT})
   --status           read-only: transport + caption state, then exit
+  --proto <ip:port>  identify a non-HTTP service by trying the usual
+                     protocol hellos and printing what answers
   --xxe [ctrlURL]    probe the SOAP parsers for external-entity handling;
                      out-of-band, nothing is written  (--xxe-file to name
                      the file a file:// entity should read)
@@ -940,6 +942,81 @@ fn run() {
     // read on the TV, and unlike the media-fetch SSRF it needs no player and no
     // ACL. Detection is out-of-band: point an entity at our own listener and see
     // whether the TV connects. Nothing is written and no action is invoked.
+    // --proto: 9999, 32768, 32769 and friends drop an HTTP request on the floor
+    // and send nothing unprompted, so they speak something else. Rather than
+    // guess one preamble at a time by hand, send the usual suspects and print
+    // whatever comes back, as text and as hex - the first bytes of a reply are
+    // usually enough to name a protocol.
+    if args.has("--proto") {
+        let target = args.val("--proto").unwrap_or_else(|| format!("{tv_ip}:9999"));
+        let addr = match target.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+            Some(a) => a,
+            None => { eprintln!("cannot resolve {target}"); return; }
+        };
+        println!("=== protocol probe {target} ===");
+
+        // (label, bytes). Kept read-only: nothing here asks a service to change
+        // state, they are all hellos and version queries.
+        let host = target.clone();
+        let tls_hello: Vec<u8> = vec![
+            0x16, 0x03, 0x01, 0x00, 0x2f, 0x01, 0x00, 0x00, 0x2b, 0x03, 0x03,
+            0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
+            0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
+            0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
+            0x00, 0x00, 0x02, 0x00, 0x2f, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let mut samsung_legacy: Vec<u8> = vec![0x00];
+        {
+            // the old iapp remote framing: 0x00, len16, "iphone.iapp.samsung"
+            let s = b"iphone.iapp.samsung";
+            samsung_legacy.push(s.len() as u8);
+            samsung_legacy.push(0x00);
+            samsung_legacy.extend_from_slice(s);
+        }
+        let json = b"{\"method\":\"ms.channel.connect\"}\n".to_vec();
+        let mut len_json = (json.len() as u32).to_be_bytes().to_vec();
+        len_json.extend_from_slice(&json);
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("HTTP GET",      format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()),
+            ("RTSP OPTIONS",  format!("OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n").into_bytes()),
+            ("SSDP M-SEARCH", b"M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n".to_vec()),
+            ("TLS ClientHello", tls_hello),
+            ("samsung iapp",  samsung_legacy),
+            ("bare JSON",     json.clone()),
+            ("len32 + JSON",  len_json),
+            ("newline",       b"\n".to_vec()),
+            ("nul byte",      vec![0x00]),
+        ];
+
+        for (label, payload) in cases {
+            print!("[{label:<16}] ");
+            let mut s = match TcpStream::connect_timeout(&addr, Duration::from_secs(4)) {
+                Ok(s) => s,
+                Err(e) => { println!("connect failed: {e}"); continue; }
+            };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+            if s.write_all(&payload).is_err() {
+                println!("write failed");
+                continue;
+            }
+            let mut buf = [0u8; 256];
+            match s.read(&mut buf) {
+                Ok(0) => println!("closed, nothing sent"),
+                Ok(n) => {
+                    let txt: String = buf[..n].iter()
+                        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                        .collect();
+                    print!("{n} bytes  hex:");
+                    for b in &buf[..n.min(24)] { print!(" {b:02x}"); }
+                    println!("\n                   txt: {}", &txt[..txt.len().min(160)]);
+                }
+                Err(_) => println!("silence"),
+            }
+        }
+        return;
+    }
+
     if args.has("--xxe") {
         let ctrl = args.val("--xxe").unwrap_or_else(||
             format!("http://{tv_ip}:9197/upnp/control/AVTransport1"));
