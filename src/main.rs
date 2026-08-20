@@ -498,6 +498,64 @@ fn coap_get(target: &str, port: u16, path: &str, query: &str, accept: Option<u32
     Ok((code, buf[i.min(buf.len())..].to_vec(), more))
 }
 
+
+/// CoAP POST/PUT with a raw payload. Used to find out whether the security
+/// resources accept unsecured writes while the device is unowned - the first
+/// probe is deliberately malformed so the answer distinguishes "write path
+/// reachable" from "write refused" without changing any state.
+fn coap_write(target: &str, port: u16, path: &str, code: u8, payload: &[u8])
+    -> std::io::Result<(u8, Vec<u8>)>
+{
+    let s = UdpSocket::bind("0.0.0.0:0")?;
+    s.set_read_timeout(Some(Duration::from_secs(4)))?;
+    let mut m = Vec::with_capacity(128);
+    m.push(0x40 | 0x02);
+    m.push(code);                     // 2 = POST, 3 = PUT
+    m.extend_from_slice(&0x4321u16.to_be_bytes());
+    m.extend_from_slice(&[0x11, 0x22]);
+    let mut last = 0u16;
+    fn opt(m: &mut Vec<u8>, num: u16, val: &[u8], last: &mut u16) {
+        let delta = num - *last;
+        *last = num;
+        let (d, dext) = if delta < 13 { (delta as u8, None) } else { (13u8, Some((delta - 13) as u8)) };
+        let l = val.len();
+        let (ln, lext) = if l < 13 { (l as u8, None) } else { (13u8, Some((l - 13) as u8)) };
+        m.push((d << 4) | ln);
+        if let Some(x) = dext { m.push(x); }
+        if let Some(x) = lext { m.push(x); }
+        m.extend_from_slice(val);
+    }
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        opt(&mut m, 11, seg.as_bytes(), &mut last);
+    }
+    opt(&mut m, 12, &[60], &mut last);   // Content-Format: application/cbor
+    if !payload.is_empty() {
+        m.push(0xff);
+        m.extend_from_slice(payload);
+    }
+    s.send_to(&m, (target, port))?;
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = s.recv_from(&mut buf)?;
+    buf.truncate(n);
+    if n < 4 { return Ok((0, buf)); }
+    let rc = buf[1];
+    let tkl = (buf[0] & 0x0f) as usize;
+    let mut i = 4 + tkl;
+    while i < buf.len() {
+        if buf[i] == 0xff { i += 1; break; }
+        let hdr = buf[i];
+        let d = (hdr >> 4) as usize;
+        let l = (hdr & 0x0f) as usize;
+        i += 1;
+        if d == 13 { i += 1; } else if d == 14 { i += 2; }
+        let mut ll = l;
+        if l == 13 { if i < buf.len() { ll = buf[i] as usize + 13; } i += 1; }
+        else if l == 14 { if i + 1 < buf.len() { ll = u16::from_be_bytes([buf[i], buf[i+1]]) as usize + 269; } i += 2; }
+        i += ll;
+    }
+    Ok((rc, buf[i.min(buf.len())..].to_vec()))
+}
+
 /// Minimal base64 for the `name=` parameter the remote channel demands.
 fn b64(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -961,6 +1019,8 @@ fn usage() {
   --media <path>     mp4 to serve, faststart    (default ./media.mp4)
   --port <n>         local HTTP port            (default {DEFAULT_PORT})
   --status           read-only: transport + caption state, then exit
+  --coap-write [p]   CoAP POST/PUT to a resource (default /oic/sec/doxm) with
+                     --coap-payload <hex> and --coap-method put|post
   --coap [path]      CoAP GET over UDP (default /oic/res); OCF discovery is
                      unsecured by spec   --coap-port / --coap-query
   --coap-accept <n>  content-format to ask for; omit to send no Accept at all
@@ -1138,6 +1198,53 @@ fn run() {
     // specification - /oic/res lists every resource the device publishes - and
     // none of it goes through dmr's registry, which is what makes it worth a
     // look now that every media path has dead-ended. GET only.
+    // --coap-write: doxm says the device is unowned and offers Just Works, yet
+    // the DTLS port refuses anonymous handshakes, so the question is whether the
+    // security resources take writes over the unsecured channel while unowned -
+    // some IoTivity builds do. The payload defaults to a single deliberately
+    // wrong CBOR byte: a 4.00 means the write path was reached and only the body
+    // was rejected, a 4.01/4.03 means writes are gated, and either answer is
+    // learned without altering a thing.
+    if args.has("--coap-write") {
+        let path = args.val("--coap-write").unwrap_or_else(|| "/oic/sec/doxm".to_string());
+        let port: u16 = args.val("--coap-port").and_then(|v| v.parse().ok()).unwrap_or(5683);
+        let method = args.val("--coap-method").unwrap_or_else(|| "post".to_string());
+        let code = if method.eq_ignore_ascii_case("put") { 3u8 } else { 2u8 };
+        let hex = args.val("--coap-payload").unwrap_or_else(|| "bf".to_string());
+        let mut payload = Vec::new();
+        let hb: Vec<char> = hex.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        for pair in hb.chunks(2) {
+            if pair.len() == 2 {
+                let s: String = pair.iter().collect();
+                if let Ok(b) = u8::from_str_radix(&s, 16) { payload.push(b); }
+            }
+        }
+        println!("=== CoAP {} coap://{tv_ip}:{port}{path}  payload {} bytes ===",
+                 method.to_uppercase(), payload.len());
+        match coap_write(&tv_ip, port, &path, code, &payload) {
+            Ok((rc, body)) => {
+                println!("    code {}.{:02}   {} bytes back", rc >> 5, rc & 0x1f, body.len());
+                if !body.is_empty() {
+                    let mut i = 0usize;
+                    let mut out = String::new();
+                    cbor(&body, &mut i, &mut out, 0);
+                    println!("{out}");
+                }
+                match rc {
+                    0x84 => println!("    4.04 not found"),
+                    0x80 => println!("    4.00 bad request - the write path IS reachable, only the body was refused"),
+                    0x81 => println!("    4.01 unauthorized - writes are gated"),
+                    0x83 => println!("    4.03 forbidden - writes are gated"),
+                    0x85 => println!("    4.05 method not allowed"),
+                    0x44 | 0x41 | 0x43 => println!("    write ACCEPTED"),
+                    _ => {}
+                }
+            }
+            Err(e) => println!("    no answer: {e}"),
+        }
+        return;
+    }
+
     if args.has("--coap") {
         let path = args.val("--coap").unwrap_or_else(|| "/oic/res".to_string());
         let port: u16 = args.val("--coap-port").and_then(|v| v.parse().ok()).unwrap_or(5683);
