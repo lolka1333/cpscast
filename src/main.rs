@@ -556,6 +556,20 @@ fn coap_write(target: &str, port: u16, path: &str, code: u8, payload: &[u8])
     Ok((rc, buf[i.min(buf.len())..].to_vec()))
 }
 
+/// Truncate for display without slicing through a character. A response can be
+/// a binary plist (AirPlay `/info` is one), and cutting such a string at a byte
+/// offset panics - which is exactly how --req died on port 39847.
+fn snip(s: &str, n: usize) -> &str {
+    if s.len() <= n {
+        return s;
+    }
+    let mut i = n;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[..i]
+}
+
 /// Minimal base64 for the `name=` parameter the remote channel demands.
 fn b64(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1342,7 +1356,7 @@ fn run() {
                         .collect();
                     print!("{n} bytes  hex:");
                     for b in &buf[..n.min(24)] { print!(" {b:02x}"); }
-                    println!("\n                   txt: {}", &txt[..txt.len().min(160)]);
+                    println!("\n                   txt: {}", snip(&txt, 160));
                 }
                 Err(_) => println!("silence"),
             }
@@ -1435,7 +1449,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()
                         body.as_bytes()) {
             Ok((c, b)) => {
                 println!("[file entity] HTTP {c}");
-                println!("    {}", &b[..b.len().min(500)]);
+                println!("    {}", snip(&b, 500));
             }
             Err(e) => println!("[file entity] {e}"),
         }
@@ -1534,7 +1548,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()
         let status = head.lines().next().unwrap_or("(nothing)").to_string();
         println!("[1] {status}");
         if !status.contains("101") {
-            println!("{}", &head[..head.len().min(400)]);
+            println!("{}", snip(&head, 400));
             return;
         }
         println!("    upgraded, no token presented");
@@ -1555,7 +1569,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()
                 continue; // ping
             }
             let txt = String::from_utf8_lossy(&payload).into_owned();
-            println!("[<] {}", &txt[..txt.len().min(800)]);
+            println!("[<] {}", snip(&txt, 800));
 
             if txt.contains("ms.channel.unauthorized") {
                 println!("    -> the channel wants the on-screen approval; no key will go through");
@@ -1736,7 +1750,7 @@ s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>\
         match r {
             Ok((c, b)) => {
                 println!("HTTP {c}");
-                println!("{}", &b[..b.len().min(1500)]);
+                println!("{}", snip(&b, 1500));
             }
             Err(e) => println!("failed: {e}"),
         }
@@ -1816,7 +1830,7 @@ s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>\
             Ok((c, b)) => {
                 println!("{method} {url} -> HTTP {c}");
                 if !b.is_empty() {
-                    println!("{}", &b[..b.len().min(1200)]);
+                    println!("{}", snip(&b, 1200));
                 }
             }
             Err(e) => println!("{method} {url} -> {e}"),
@@ -1911,7 +1925,7 @@ s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>\
                         if c == 201 { "  LAUNCHED - look at the screen" } else { "" }
                     );
                     if c != 201 && !b.is_empty() {
-                        println!("    {}", &b[..b.len().min(200)]);
+                        println!("    {}", snip(&b, 200));
                     }
                 }
                 Err(e) => println!("[2] POST {app} -> {e}"),
@@ -2142,7 +2156,7 @@ s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>\
     );
     println!(
         "[1] SetAVTransportURI (+sec:CaptionInfoEx) -> HTTP {c}{}",
-        if c == 200 { "  OK".to_string() } else { format!("\n    {}", &raw[..raw.len().min(300)]) }
+        if c == 200 { "  OK".to_string() } else { format!("\n    {}", snip(&raw, 300)) }
     );
 
     // --probe: which AVTransport actions are actually ACL-gated?
@@ -2192,7 +2206,7 @@ s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>\
     let (c, raw) = tv.av("Play", "<Speed>1</Speed>");
     println!(
         "[2] Play -> HTTP {c}{}",
-        if c == 200 { "  OK".to_string() } else { format!("\n    {}", &raw[..raw.len().min(300)]) }
+        if c == 200 { "  OK".to_string() } else { format!("\n    {}", snip(&raw, 300)) }
     );
 
     // Polling costs the renderer two fresh TCP connections per call, which is a
